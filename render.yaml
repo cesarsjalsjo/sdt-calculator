@@ -1,14 +1,10 @@
-# render.yaml — Render.com deployment configuration
-# This file tells Render exactly how to build and run your app.
-# Just connect your GitHub repo on render.com and it reads this automatically.
-
 services:
   - type: web
     name: sdt-calculator
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
-    plan: free          # Free tier — no credit card needed
+    plan: free
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
