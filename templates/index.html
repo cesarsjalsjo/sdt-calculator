@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SDT Calculator — Spin Diffusion Tensor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Syne:wght@400;600;800&display=swap" rel="stylesheet"/>
+
+<style>
+/* ============================================================
+   DESIGN LANGUAGE: Scientific instrument — dark, precise,
+   monospaced readouts, amber accents on near-black.
+   Feels like a high-end NMR spectrometer UI.
+   ============================================================ */
+
+:root {
+  --bg:       #0a0c0f;
+  --surface:  #111418;
+  --border:   #1e2530;
+  --amber:    #f0a500;
+  --amber-dim:#7a5200;
+  --cyan:     #00c8c8;
+  --text:     #c8d4e0;
+  --dim:      #4a5a6a;
+  --error:    #e05555;
+  --success:  #3ecf8e;
+  --mono:     'JetBrains Mono', monospace;
+  --display:  'Syne', sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* Subtle scanline texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.08) 2px,
+    rgba(0,0,0,0.08) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Header ────────────────────────────────────────────── */
+header {
+  border-bottom: 1px solid var(--border);
+  padding: 28px 48px;
+  display: flex;
+  align-items: baseline;
+  gap: 20px;
+  position: sticky;
+  top: 0;
+  background: rgba(10,12,15,0.92);
+  backdrop-filter: blur(12px);
+  z-index: 100;
+}
+
+.logo {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--amber);
+  letter-spacing: -0.5px;
+}
+
+.logo span { color: var(--dim); font-weight: 400; }
+
+.tagline {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+/* ── Main layout ───────────────────────────────────────── */
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 52px 48px 80px;
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 40px;
+  align-items: start;
+}
+
+/* ── Panel (reusable card) ─────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.panel-header {
+  background: var(--border);
+  padding: 10px 20px;
+  font-size: 10px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--amber);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-header::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  display: inline-block;
+  animation: blink 2s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+
+.panel-body { padding: 24px 20px; }
+
+/* ── Drop zone ─────────────────────────────────────────── */
+#drop-zone {
+  border: 1px dashed var(--amber-dim);
+  border-radius: 3px;
+  padding: 36px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  position: relative;
+}
+
+#drop-zone:hover,
+#drop-zone.drag-over {
+  border-color: var(--amber);
+  background: rgba(240,165,0,0.04);
+}
+
+#drop-zone input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  width: 100%;
+  height: 100%;
+}
+
+.drop-icon {
+  font-size: 32px;
+  margin-bottom: 10px;
+  opacity: 0.5;
+}
+
+.drop-label {
+  font-family: var(--display);
+  font-size: 14px;
+  color: var(--text);
+}
+
+.drop-sub {
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+#file-name {
+  margin-top: 10px;
+  color: var(--amber);
+  font-size: 11px;
+  min-height: 16px;
+  word-break: break-all;
+}
+
+/* ── Form fields ───────────────────────────────────────── */
+.field-group { margin-top: 20px; }
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.field label {
+  display: block;
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+
+.field input,
+.field select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 10px;
+  transition: border-color 0.15s;
+  outline: none;
+  appearance: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: var(--amber);
+}
+
+.field select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23f0a500'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+  cursor: pointer;
+}
+
+.field input[type="range"] {
+  padding: 4px 0;
+  accent-color: var(--amber);
+  cursor: pointer;
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#disorder-val {
+  color: var(--amber);
+  font-size: 13px;
+  min-width: 30px;
+  text-align: right;
+}
+
+/* ── Calculate button ──────────────────────────────────── */
+#calc-btn {
+  width: 100%;
+  margin-top: 20px;
+  background: var(--amber);
+  color: var(--bg);
+  border: none;
+  border-radius: 3px;
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 1px;
+  padding: 13px;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  text-transform: uppercase;
+}
+
+#calc-btn:hover:not(:disabled) {
+  background: #ffbe30;
+  transform: translateY(-1px);
+}
+
+#calc-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* ── Right column: results ─────────────────────────────── */
+#results-col {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+/* ── Status / progress bar ─────────────────────────────── */
+#status-bar {
+  display: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px 20px;
+}
+
+#status-bar.visible { display: block; }
+
+.progress-label {
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+
+.progress-track {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--amber);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.4s ease;
+  animation: indeterminate 1.4s ease infinite;
+}
+
+@keyframes indeterminate {
+  0%   { transform: translateX(-100%); width: 60%; }
+  100% { transform: translateX(200%);  width: 60%; }
+}
+
+.progress-fill.done {
+  animation: none;
+  width: 100%;
+  background: var(--success);
+}
+
+.status-msg {
+  margin-top: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.status-msg.error { color: var(--error); }
+
+/* ── Tensor matrix display ─────────────────────────────── */
+.tensor-display {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.tensor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-top: 12px;
+}
+
+.tensor-cell {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 10px 8px;
+  text-align: center;
+  color: var(--amber);
+  font-size: 13px;
+  transition: background 0.3s, color 0.3s;
+  animation: fadeIn 0.4s ease both;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+.tensor-cell:nth-child(1)  { animation-delay: 0.05s; }
+.tensor-cell:nth-child(2)  { animation-delay: 0.10s; }
+.tensor-cell:nth-child(3)  { animation-delay: 0.15s; }
+.tensor-cell:nth-child(4)  { animation-delay: 0.20s; }
+.tensor-cell:nth-child(5)  { animation-delay: 0.25s; }
+.tensor-cell:nth-child(6)  { animation-delay: 0.30s; }
+.tensor-cell:nth-child(7)  { animation-delay: 0.35s; }
+.tensor-cell:nth-child(8)  { animation-delay: 0.40s; }
+.tensor-cell:nth-child(9)  { animation-delay: 0.45s; }
+
+/* Dim near-zero off-diagonal elements */
+.tensor-cell.near-zero { color: var(--dim); }
+
+/* ── Scalar readouts ───────────────────────────────────── */
+.readouts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.readout {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 14px 16px;
+  animation: fadeIn 0.5s ease both;
+}
+
+.readout-label {
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+
+.readout-value {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--cyan);
+}
+
+.readout-unit {
+  font-size: 10px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+/* ── Unit cell summary ─────────────────────────────────── */
+.cell-params {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.cell-param {
+  text-align: center;
+  padding: 8px 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+.cell-param-name {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.cell-param-value {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 2px;
+}
+
+/* ── Placeholder state ─────────────────────────────────── */
+#placeholder {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 60px 40px;
+  text-align: center;
+  color: var(--dim);
+}
+
+#placeholder .ph-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.3; }
+#placeholder .ph-text { font-family: var(--display); font-size: 15px; }
+#placeholder .ph-sub  { font-size: 11px; margin-top: 6px; }
+
+/* ── Footer ────────────────────────────────────────────── */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 20px 48px;
+  color: var(--dim);
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── Responsive ────────────────────────────────────────── */
+@media (max-width: 800px) {
+  main {
+    grid-template-columns: 1fr;
+    padding: 32px 20px;
+  }
+  header { padding: 20px; }
+  footer { padding: 16px 20px; flex-direction: column; gap: 4px; }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="logo">SDT<span>calc</span></div>
+  <div class="tagline">Spin Diffusion Tensor Calculator</div>
+</header>
+
+<main>
+
+  <!-- ── LEFT: Input panel ───────────────────────────────── -->
+  <div>
+    <div class="panel">
+      <div class="panel-header">Input Parameters</div>
+      <div class="panel-body">
+
+        <!-- File drop zone -->
+        <div id="drop-zone">
+          <input type="file" id="cif-file" accept=".cif"/>
+          <div class="drop-icon">⬡</div>
+          <div class="drop-label">Drop your CIF file here</div>
+          <div class="drop-sub">or click to browse</div>
+          <div id="file-name"></div>
+        </div>
+
+        <!-- Parameters -->
+        <div class="field-group">
+          <div class="field-row">
+            <div class="field">
+              <label>Nucleus</label>
+              <select id="nucleus">
+                <option value="F">¹⁹F</option>
+                <option value="H">¹H</option>
+                <option value="P">³¹P</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>B₀ Field / T</label>
+              <input type="number" id="b0field" value="9.4" min="1" max="30" step="0.1"/>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label>Spin sites (N)</label>
+              <input type="number" id="nwanted" value="5000" min="100" max="20000" step="100"/>
+            </div>
+            <div class="field">
+              <label>Disorder [0–1]</label>
+              <div class="slider-row">
+                <input type="range" id="disorder" min="0" max="1" step="0.05" value="0"
+                       oninput="document.getElementById('disorder-val').textContent=this.value"/>
+                <span id="disorder-val">0</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button id="calc-btn" onclick="runCalc()" disabled>Calculate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RIGHT: Results column ───────────────────────────── -->
+  <div id="results-col">
+
+    <!-- Status / progress -->
+    <div id="status-bar">
+      <div class="progress-label">Status</div>
+      <div class="progress-track">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="status-msg" id="status-msg">Uploading file…</div>
+    </div>
+
+    <!-- Placeholder before first calculation -->
+    <div id="placeholder">
+      <div class="ph-icon">⟨D⟩</div>
+      <div class="ph-text">Results will appear here</div>
+      <div class="ph-sub">Upload a CIF file and press Calculate</div>
+    </div>
+
+    <!-- Diffusion tensor (hidden until result arrives) -->
+    <div class="panel" id="tensor-panel" style="display:none">
+      <div class="panel-header">Diffusion Tensor D / nm² s⁻¹</div>
+      <div class="panel-body">
+        <div class="tensor-grid" id="tensor-grid"></div>
+      </div>
+    </div>
+
+    <!-- Scalar readouts -->
+    <div id="readout-panel" style="display:none">
+      <div class="readouts">
+        <div class="readout" style="animation-delay:0.1s">
+          <div class="readout-label">D<sub>iso</sub></div>
+          <div class="readout-value" id="r-diso">—</div>
+          <div class="readout-unit">nm² s⁻¹</div>
+        </div>
+        <div class="readout" style="animation-delay:0.2s">
+          <div class="readout-label">D<sub>FA</sub></div>
+          <div class="readout-value" id="r-dfa">—</div>
+          <div class="readout-unit">fractional anisotropy</div>
+        </div>
+        <div class="readout" style="animation-delay:0.3s">
+          <div class="readout-label">D<sub>∥</sub></div>
+          <div class="readout-value" id="r-dpar">—</div>
+          <div class="readout-unit">nm² s⁻¹</div>
+        </div>
+        <div class="readout" style="animation-delay:0.4s">
+          <div class="readout-label">D<sub>⊥</sub></div>
+          <div class="readout-value" id="r-dperp">—</div>
+          <div class="readout-unit">nm² s⁻¹</div>
+        </div>
+        <div class="readout" style="animation-delay:0.5s">
+          <div class="readout-label">M₂</div>
+          <div class="readout-value" id="r-m2">—</div>
+          <div class="readout-unit">Hz²</div>
+        </div>
+        <div class="readout" style="animation-delay:0.6s">
+          <div class="readout-label">N spins</div>
+          <div class="readout-value" id="r-n">—</div>
+          <div class="readout-unit">sites</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Unit cell info -->
+    <div class="panel" id="cell-panel" style="display:none">
+      <div class="panel-header">Unit Cell Parameters</div>
+      <div class="panel-body">
+        <div class="cell-params" id="cell-params"></div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <span>SDTcalc — Secular Redfield spin diffusion tensor calculator</span>
+  <span>CIF → D tensor in seconds</span>
+</footer>
+
+<script>
+// ============================================================
+//  FILE INPUT HANDLING
+// ============================================================
+
+const dropZone  = document.getElementById("drop-zone");
+const fileInput = document.getElementById("cif-file");
+const fileLabel = document.getElementById("file-name");
+const calcBtn   = document.getElementById("calc-btn");
+
+// Show chosen filename and enable the button
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) {
+    fileLabel.textContent = "✓ " + fileInput.files[0].name;
+    calcBtn.disabled = false;
+  }
+});
+
+// Drag-and-drop visual feedback
+dropZone.addEventListener("dragover",  e => { e.preventDefault(); dropZone.classList.add("drag-over"); });
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+dropZone.addEventListener("drop",      e => {
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  const dt = e.dataTransfer;
+  if (dt.files.length) {
+    fileInput.files = dt.files;   // Assign dropped file to the input
+    fileLabel.textContent = "✓ " + dt.files[0].name;
+    calcBtn.disabled = false;
+  }
+});
+
+
+// ============================================================
+//  CALCULATION
+// ============================================================
+
+async function runCalc() {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  // Build form data to send to /calculate
+  const form = new FormData();
+  form.append("file",      file);
+  form.append("nucleus",   document.getElementById("nucleus").value);
+  form.append("B0_field",  document.getElementById("b0field").value);
+  form.append("N_wanted",  document.getElementById("nwanted").value);
+  form.append("disorder",  document.getElementById("disorder").value);
+
+  // Show progress bar
+  setStatus("visible", false, "Uploading and computing — this may take a few seconds…");
+  calcBtn.disabled = true;
+
+  // Hide previous results
+  document.getElementById("placeholder").style.display   = "none";
+  document.getElementById("tensor-panel").style.display  = "none";
+  document.getElementById("readout-panel").style.display = "none";
+  document.getElementById("cell-panel").style.display    = "none";
+
+  try {
+    const response = await fetch("/calculate", { method: "POST", body: form });
+    const data     = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || "Unknown server error.");
+    }
+
+    renderResults(data.result);
+    setStatus("visible", true, `Done — ${data.result.N_spins.toLocaleString()} spin sites computed.`);
+
+  } catch (err) {
+    setStatus("error", false, "Error: " + err.message);
+  } finally {
+    calcBtn.disabled = false;
+  }
+}
+
+
+// ============================================================
+//  RENDER RESULTS
+// ============================================================
+
+function renderResults(r) {
+
+  // --- Diffusion tensor 3×3 grid ---
+  const grid   = document.getElementById("tensor-grid");
+  const D      = r.D;
+  // Find the max absolute value for normalising near-zero detection
+  const absMax = Math.max(...D.flat().map(Math.abs));
+
+  grid.innerHTML = "";
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      const val  = D[i][j];
+      const cell = document.createElement("div");
+      cell.className = "tensor-cell";
+      if (Math.abs(val) < 0.001 * absMax) cell.classList.add("near-zero");
+      cell.textContent = fmtNum(val);
+      grid.appendChild(cell);
+    }
+  }
+  document.getElementById("tensor-panel").style.display = "block";
+
+  // --- Scalar readouts ---
+  document.getElementById("r-diso").textContent  = fmtNum(r.D_iso);
+  document.getElementById("r-dfa").textContent   = r.D_FA.toFixed(4);
+  document.getElementById("r-dpar").textContent  = fmtNum(r.D_parallel);
+  document.getElementById("r-dperp").textContent = fmtNum(r.D_perp);
+  document.getElementById("r-m2").textContent    = r.M2.toExponential(3);
+  document.getElementById("r-n").textContent     = r.N_spins.toLocaleString();
+  document.getElementById("readout-panel").style.display = "block";
+
+  // --- Unit cell parameters ---
+  const uc   = r.unit_cell;
+  const params = document.getElementById("cell-params");
+  const items = [
+    ["a",  (uc.a * 1e10).toFixed(4) + " Å"],
+    ["b",  (uc.b * 1e10).toFixed(4) + " Å"],
+    ["c",  (uc.c * 1e10).toFixed(4) + " Å"],
+    ["α",  rad2deg(uc.alpha).toFixed(2) + "°"],
+    ["β",  rad2deg(uc.beta).toFixed(2)  + "°"],
+    ["γ",  rad2deg(uc.gamma).toFixed(2) + "°"],
+  ];
+  params.innerHTML = items.map(([name, val]) =>
+    `<div class="cell-param">
+       <div class="cell-param-name">${name}</div>
+       <div class="cell-param-value">${val}</div>
+     </div>`
+  ).join("");
+  document.getElementById("cell-panel").style.display = "block";
+}
+
+
+// ============================================================
+//  HELPERS
+// ============================================================
+
+function setStatus(state, done, msg) {
+  const bar  = document.getElementById("status-bar");
+  const fill = document.getElementById("progress-fill");
+  const txt  = document.getElementById("status-msg");
+
+  bar.className = state === "hidden" ? "" : "visible";
+
+  if (done) {
+    fill.className = "progress-fill done";
+  } else {
+    fill.className = "progress-fill";  // Restarts indeterminate animation
+  }
+
+  txt.className = "status-msg" + (state === "error" ? " error" : "");
+  txt.textContent = msg;
+}
+
+// Format a diffusion tensor value: scientific if very small, fixed otherwise
+function fmtNum(v) {
+  if (v === null || v === undefined) return "—";
+  const a = Math.abs(v);
+  if (a === 0)    return "0";
+  if (a < 0.001)  return v.toExponential(2);
+  if (a > 99999)  return v.toExponential(3);
+  return v.toFixed(2);
+}
+
+function rad2deg(r) { return r * 180 / Math.PI; }
+</script>
+
+</body>
+</html>
