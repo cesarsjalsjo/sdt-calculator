@@ -6,6 +6,7 @@
 <title>SDT Calculator — Spin Diffusion Tensor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Syne:wght@400;600;800&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
 
 <style>
 /* ============================================================
@@ -474,8 +475,36 @@ footer {
   justify-content: space-between;
 }
 
-/* ── Responsive ────────────────────────────────────────── */
+/* ── 3D Plot panels ────────────────────────────────────── */
+.plot-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.plot-container {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  height: 320px;
+  position: relative;
+}
+
+.plot-label {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--dim);
+  z-index: 10;
+  pointer-events: none;
+}
+
 @media (max-width: 800px) {
+  .plot-grid { grid-template-columns: 1fr; }
+}
   main {
     grid-template-columns: 1fr;
     padding: 32px 20px;
@@ -565,6 +594,25 @@ footer {
       <div class="ph-icon">⟨D⟩</div>
       <div class="ph-text">Results will appear here</div>
       <div class="ph-sub">Upload a CIF file and press Calculate</div>
+    </div>
+
+    <!-- Unit cell + spin cloud plots (hidden until result arrives) -->
+    <div id="plots-panel" style="display:none">
+      <div class="panel">
+        <div class="panel-header">3D Visualisation</div>
+        <div class="panel-body" style="padding: 12px;">
+          <div class="plot-grid">
+            <div style="position:relative;">
+              <div class="plot-label">Unit Cell (fractional coords)</div>
+              <div class="plot-container" id="plot-unitcell"></div>
+            </div>
+            <div style="position:relative;">
+              <div class="plot-label">Spin Cloud / nm</div>
+              <div class="plot-container" id="plot-spincloud"></div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Diffusion tensor (hidden until result arrives) -->
@@ -711,7 +759,9 @@ async function runCalc() {
 
 function renderResults(r) {
 
-  // --- Diffusion tensor 3×3 grid ---
+  // Show plots
+  document.getElementById("plots-panel").style.display = "block";
+  renderPlots(r);
   const grid   = document.getElementById("tensor-grid");
   const D      = r.D;
   // Find the max absolute value for normalising near-zero detection
@@ -757,6 +807,119 @@ function renderResults(r) {
      </div>`
   ).join("");
   document.getElementById("cell-panel").style.display = "block";
+}
+
+
+// ============================================================
+//  3D PLOTS  (Plotly)
+// ============================================================
+
+function renderPlots(r) {
+  const dark = {
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor:  'rgba(0,0,0,0)',
+    font:  { color: '#4a5a6a', family: 'JetBrains Mono', size: 10 },
+    margin: { l: 0, r: 0, t: 30, b: 0 },
+    scene: {
+      bgcolor: '#0a0c0f',
+      xaxis: { gridcolor: '#1e2530', zerolinecolor: '#1e2530', title: '' },
+      yaxis: { gridcolor: '#1e2530', zerolinecolor: '#1e2530', title: '' },
+      zaxis: { gridcolor: '#1e2530', zerolinecolor: '#1e2530', title: '' },
+    },
+    showlegend: false,
+  };
+
+  // --- Plot 1: Unit cell — large black spheres in fractional [0,1]³ space ---
+  // This mirrors MATLAB's scatter3(uniqueCoords, 500, 'filled') with black markers
+  const uc = r.unique_coords;
+  const ucx = uc.map(p => p[0]);
+  const ucy = uc.map(p => p[1]);
+  const ucz = uc.map(p => p[2]);
+
+  // Draw the unit cell wireframe box edges (12 edges of a unit cube)
+  const boxEdges = makeBoxEdges();
+
+  const unitCellData = [
+    // Wireframe box
+    ...boxEdges,
+    // Atom sites — large filled black spheres (amber in dark theme)
+    {
+      type: 'scatter3d',
+      x: ucx, y: ucy, z: ucz,
+      mode: 'markers',
+      marker: {
+        size: 10,
+        color: '#f0a500',       // Amber — equivalent to black on white in MATLAB
+        opacity: 1.0,
+        line: { color: '#f0a500', width: 1 },
+      },
+    },
+  ];
+
+  const ucLayout = {
+    ...dark,
+    scene: {
+      ...dark.scene,
+      xaxis: { ...dark.scene.xaxis, title: 'a', range: [0, 1] },
+      yaxis: { ...dark.scene.yaxis, title: 'b', range: [0, 1] },
+      zaxis: { ...dark.scene.zaxis, title: 'c', range: [0, 1] },
+      aspectmode: 'cube',
+      camera: { eye: { x: 1.4, y: 0.8, z: 1.2 } },  // Matches MATLAB view([20 80 20])
+    },
+  };
+
+  Plotly.newPlot('plot-unitcell', unitCellData, ucLayout, { responsive: true, displayModeBar: false });
+
+  // --- Plot 2: Full spin cloud in Cartesian nm coordinates ---
+  // Mirrors MATLAB's scatter3(x*1e9, y*1e9, z*1e9, 10) with blue markers
+  const sc = r.cartesian_sample;
+  const spinCloudData = [{
+    type: 'scatter3d',
+    x: sc.x, y: sc.y, z: sc.z,
+    mode: 'markers',
+    marker: {
+      size: 2,
+      color: '#00c8c8',    // Cyan — equivalent to MATLAB blue
+      opacity: 0.7,
+    },
+  }];
+
+  const scLayout = {
+    ...dark,
+    scene: {
+      ...dark.scene,
+      xaxis: { ...dark.scene.xaxis, title: 'X / nm' },
+      yaxis: { ...dark.scene.yaxis, title: 'Y / nm' },
+      zaxis: { ...dark.scene.zaxis, title: 'Z / nm' },
+      aspectmode: 'data',
+    },
+  };
+
+  Plotly.newPlot('plot-spincloud', spinCloudData, scLayout, { responsive: true, displayModeBar: false });
+}
+
+// Build the 12 edges of a unit cube as Plotly line traces
+function makeBoxEdges() {
+  // 8 corners of the unit cube
+  const corners = [
+    [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+    [0,0,1],[1,0,1],[1,1,1],[0,1,1],
+  ];
+  // 12 edges defined by pairs of corner indices
+  const edges = [
+    [0,1],[1,2],[2,3],[3,0],  // bottom face
+    [4,5],[5,6],[6,7],[7,4],  // top face
+    [0,4],[1,5],[2,6],[3,7],  // vertical edges
+  ];
+
+  return edges.map(([i, j]) => ({
+    type: 'scatter3d',
+    x: [corners[i][0], corners[j][0]],
+    y: [corners[i][1], corners[j][1]],
+    z: [corners[i][2], corners[j][2]],
+    mode: 'lines',
+    line: { color: '#1e2530', width: 2 },
+  }));
 }
 
 

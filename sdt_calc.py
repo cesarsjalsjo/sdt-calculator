@@ -67,7 +67,7 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
     # -------------------------------------------------------------------------
     # 1. Parse CIF → Cartesian spin-site coordinates
     # -------------------------------------------------------------------------
-    coords, cell = parse_cif(cif_text, nucleus, N_wanted, abund)
+    coords, cell, unique_coords = parse_cif(cif_text, nucleus, N_wanted, abund)
     x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
     N = len(x)
 
@@ -114,6 +114,9 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
     np.fill_diagonal(dists, np.inf)
     nn = dists.min(axis=1)                               # N-vector of NN distances
 
+    # Sub-sample cartesian coords for the 3D cloud plot (max 3000 points for browser performance)
+    plot_idx = np.random.choice(N, min(N, 3000), replace=False)
+
     return {
         "D":                result["D"].tolist(),
         "D_iso":            float(result["D_iso"]),
@@ -128,10 +131,17 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
             "mean":  float(nn.mean()),
             "min":   float(nn.min()),
             "max":   float(nn.max()),
-            "hist_counts": None,   # populated below
-            "hist_edges":  None,
         },
         "unit_cell": {k: float(v) for k, v in cell.items()},
+        # --- Plotting data ---
+        # unique_coords: fractional [0,1]³ coords of unique sites in one unit cell
+        "unique_coords": unique_coords.tolist(),
+        # cartesian_sample: nm-scaled Cartesian coords for the full spin cloud plot
+        "cartesian_sample": {
+            "x": (x[plot_idx] * 1e9).tolist(),
+            "y": (y[plot_idx] * 1e9).tolist(),
+            "z": (z[plot_idx] * 1e9).tolist(),
+        },
     }
 
 
@@ -239,7 +249,7 @@ def parse_cif(cif_text: str, nucleus: str, N_wanted: int, abund: float) -> tuple
     keep = np.random.rand(len(cartesian)) < abund
     cartesian = cartesian[keep]
 
-    return cartesian, cell
+    return cartesian, cell, unique_coords
 
 
 def apply_symmetry(lines: list, base_coords: np.ndarray) -> np.ndarray:
