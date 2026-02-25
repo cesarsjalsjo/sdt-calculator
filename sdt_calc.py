@@ -46,23 +46,30 @@ SHIFTML_ELEMENTS = {"H", "C", "N", "O", "S", "F", "P", "Cl", "Na", "Ca", "Mg", "
 
 def run_shiftml(cif_text: str, nucleus: str):
     """
-    Run ShiftML3 in an isolated subprocess.
+    Run ShiftML3 in an isolated subprocess with gevent-friendly polling.
 
-    Isolating in a subprocess means an OOM or torch crash there
-    cannot kill the Gunicorn worker — we get a clean error string back.
+    subprocess.run() blocks the entire gevent hub (it calls select() internally),
+    which prevents Gunicorn's heartbeat and triggers WORKER TIMEOUT even under
+    gevent monkey-patching.  The fix: use Popen and poll() in a loop with
+    gevent.sleep() so the hub can service other greenlets while we wait.
 
     Returns (cs_iso, cs_delta, cs_eta, atom_idx) on success.
     Raises ValueError with a clear message on failure.
     """
-    import subprocess, sys, json as _json, tempfile, os
+    import subprocess, sys, json as _json, tempfile, os, time
 
-    # Write the CIF to a temp file so the subprocess can read it
+    # Try to import gevent.sleep for cooperative yielding; fall back to time.sleep
+    try:
+        from gevent import sleep as gsleep
+    except ImportError:
+        from time import sleep as gsleep
+
+    # Write CIF to a temp file for the subprocess
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cif",
                                      delete=False, encoding="utf-8") as tf:
         tf.write(cif_text)
         cif_path = tf.name
 
-    # This mini-script runs inside the subprocess
     worker_script = f"""
 import sys, json, numpy as np
 cif_path = {repr(cif_path)}
@@ -106,43 +113,63 @@ except Exception as e:
     print(json.dumps({{'error': str(e)}}))
 """
 
+    TIMEOUT = 150   # seconds — generous for model download + inference
+    proc = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-c", worker_script],
-            capture_output=True, text=True,
-            timeout=120,          # 2-minute hard limit
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-    except subprocess.TimeoutExpired:
-        raise ValueError("ShiftML3 timed out (>120 s). "
-                         "The free-tier server may be too slow for this structure.")
+
+        deadline = time.time() + TIMEOUT
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                raise ValueError(
+                    f"ShiftML3 timed out after {TIMEOUT}s. "
+                    "The free-tier server is too memory-constrained for this model. "
+                    "Try a different nucleus or use Manual / None CS mode."
+                )
+            gsleep(0.5)   # yield to gevent hub — keeps SSE alive and heartbeat running
+
+        stdout, stderr = proc.communicate()
+
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"ShiftML3 subprocess error: {e}")
     finally:
         try:
             os.unlink(cif_path)
         except OSError:
             pass
+        if proc and proc.poll() is None:
+            proc.kill()
 
-    # Parse output — the last non-empty stdout line should be our JSON
-    stdout_lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    # Parse the last non-empty line of stdout as JSON
+    stdout_lines = [l.strip() for l in stdout.splitlines() if l.strip()]
     if not stdout_lines:
-        stderr_snippet = proc.stderr[-600:] if proc.stderr else "(no stderr)"
+        snippet = stderr[-400:] if stderr else "(no stderr)"
         raise ValueError(
-            f"ShiftML3 subprocess produced no output. "
-            f"Likely out of memory on the free tier.\n"
-            f"stderr: {stderr_snippet}"
+            "ShiftML3 produced no output — likely killed by OOM on the free tier. "
+            f"stderr: {snippet}"
         )
 
     try:
         result = _json.loads(stdout_lines[-1])
     except _json.JSONDecodeError:
-        raise ValueError(
-            f"ShiftML3 output could not be parsed: {stdout_lines[-1][:200]}"
-        )
+        raise ValueError(f"ShiftML3 output unparseable: {stdout_lines[-1][:200]}")
 
     if "error" in result:
         raise ValueError(f"ShiftML3: {result['error']}")
 
     cs_iso   = np.array(result["iso"],   dtype=float)
     cs_delta = np.array(result["delta"], dtype=float)
+    cs_eta   = np.array(result["eta"],   dtype=float)
+    atom_idx = np.array(result["idx"],   dtype=int)
+    return cs_iso, cs_delta, cs_eta, atom_idx
     cs_eta   = np.array(result["eta"],   dtype=float)
     atom_idx = np.array(result["idx"],   dtype=int)
 

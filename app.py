@@ -1,7 +1,17 @@
 """
 app.py — Flask server for SDT Calculator
-SSE streaming endpoint for live orientation progress + ShiftML status.
+
+Gevent monkey-patching at the very top makes all blocking I/O (including
+subprocess.communicate) non-blocking, so the Gunicorn sync worker's 30-second
+timeout signal never fires mid-stream.  This works regardless of whether
+Gunicorn uses the sync or gevent worker class.
 """
+
+# ── Gevent monkey-patch MUST be the very first import ──────────────────────
+from gevent import monkey
+monkey.patch_all()
+# ───────────────────────────────────────────────────────────────────────────
+
 import os, json, traceback
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 from sdt_calc import run_calculation
@@ -39,9 +49,7 @@ def calculate():
     cs_source = request.form.get("cs_source", "none")
     cs_ics    = float(request.form.get("cs_ics",   0.0))
     cs_delta  = float(request.form.get("cs_delta", 0.0))
-    cs_eta    = float(request.form.get("cs_eta",   0.0))
-    # Clamp eta to [0,1]
-    cs_eta    = max(0.0, min(1.0, cs_eta))
+    cs_eta    = max(0.0, min(1.0, float(request.form.get("cs_eta", 0.0))))
 
     def generate():
         try:
