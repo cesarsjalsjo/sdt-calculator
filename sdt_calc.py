@@ -71,7 +71,18 @@ def run_shiftml(cif_text: str, nucleus: str):
         cif_path = tf.name
 
     worker_script = f"""
-import sys, json, numpy as np
+import sys, json, subprocess, numpy as np
+
+# Install dependencies at runtime if not present (keeps build lean)
+def ensure(pkg, import_name=None):
+    try:
+        __import__(import_name or pkg)
+    except ImportError:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'], check=True)
+
+ensure('ase')
+ensure('shiftml')
+
 cif_path = {repr(cif_path)}
 nucleus  = {repr(nucleus)}
 try:
