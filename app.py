@@ -84,7 +84,7 @@ def calculate():
     N_wanted = int(request.form.get("N_wanted", 5000))
 
     # Clamp N_wanted to a safe range (very large N is slow in a web context)
-    N_wanted = max(100, min(N_wanted, 20000))
+    N_wanted = max(100, min(N_wanted, 2000))
 
     # --- Run calculation ---
     try:
