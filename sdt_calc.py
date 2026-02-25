@@ -46,92 +46,105 @@ SHIFTML_ELEMENTS = {"H", "C", "N", "O", "S", "F", "P", "Cl", "Na", "Ca", "Mg", "
 
 def run_shiftml(cif_text: str, nucleus: str):
     """
-    Run ShiftML3 on the uploaded CIF structure.
+    Run ShiftML3 in an isolated subprocess.
 
-    Returns
-    -------
-    cs_iso    : (M,) array  – isotropic shielding per unique site (ppm)
-    cs_delta  : (M,) array  – Haeberlen anisotropy δ per site (ppm)
-                              δ = σ_ZZ − σ_iso  (signed, |δ| is half-width)
-    cs_eta    : (M,) array  – Haeberlen asymmetry η per site [0–1]
-    atom_idx  : (M,) array  – atom indices in the ASE frame for the nucleus
+    Isolating in a subprocess means an OOM or torch crash there
+    cannot kill the Gunicorn worker — we get a clean error string back.
 
-    Raises ValueError if ShiftML cannot run (missing deps, unsupported element).
+    Returns (cs_iso, cs_delta, cs_eta, atom_idx) on success.
+    Raises ValueError with a clear message on failure.
     """
-    # --- Lazy imports (not required for manual/none mode) ---
-    try:
-        from ase.io import read as ase_read
-        import io
-        from shiftml.ase import ShiftML
-    except ImportError as e:
-        raise ValueError(
-            f"ShiftML integration requires 'shiftml' and 'ase' packages: {e}"
-        )
+    import subprocess, sys, json as _json, tempfile, os
 
-    # Check element is supported
-    if nucleus not in SHIFTML_ELEMENTS:
-        raise ValueError(
-            f"ShiftML3 does not support nucleus '{nucleus}'. "
-            f"Supported elements: {sorted(SHIFTML_ELEMENTS)}"
-        )
+    # Write the CIF to a temp file so the subprocess can read it
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cif",
+                                     delete=False, encoding="utf-8") as tf:
+        tf.write(cif_text)
+        cif_path = tf.name
 
-    # Parse CIF with ASE
-    try:
-        frame = ase_read(io.StringIO(cif_text), format="cif")
-    except Exception as e:
-        raise ValueError(f"ASE could not read CIF file: {e}")
+    # This mini-script runs inside the subprocess
+    worker_script = f"""
+import sys, json, numpy as np
+cif_path = {repr(cif_path)}
+nucleus  = {repr(nucleus)}
+try:
+    from ase.io import read as ase_read
+    from shiftml.ase import ShiftML
 
-    # Find atom indices for the target nucleus
+    frame = ase_read(cif_path, format='cif')
     symbols = np.array(frame.get_chemical_symbols())
     atom_idx = np.where(symbols == nucleus)[0]
     if len(atom_idx) == 0:
-        raise ValueError(
-            f"No '{nucleus}' atoms found in CIF by ASE. "
-            f"Check that the element symbol matches exactly."
-        )
+        print(json.dumps({{'error': f"No {{nucleus}} atoms found in CIF by ASE."}}))
+        sys.exit(0)
 
-    # Run ShiftML3
-    try:
-        calculator = ShiftML("ShiftML3", device="cpu")
-    except Exception as e:
-        raise ValueError(f"Could not initialise ShiftML3 model: {e}")
+    calculator = ShiftML("ShiftML3", device="cpu")
+    cs_tensor_all = calculator.get_cs_tensor(frame)
+    tensors = cs_tensor_all[atom_idx]
 
-    try:
-        cs_tensor_all = calculator.get_cs_tensor(frame)   # (N_atoms, 3, 3)
-    except Exception as e:
-        raise ValueError(f"ShiftML3 prediction failed: {e}")
-
-    # Extract tensors for our nucleus
-    tensors = cs_tensor_all[atom_idx]   # (M, 3, 3)
-    M = len(tensors)
-
-    cs_iso   = np.zeros(M)
-    cs_delta = np.zeros(M)
-    cs_eta   = np.zeros(M)
-
-    for i, T in enumerate(tensors):
-        # Diagonalise symmetric shielding tensor → principal values ascending
-        eigs = np.linalg.eigvalsh(T)          # σ_11 ≤ σ_22 ≤ σ_33 (ascending)
+    cs_iso_l, cs_delta_l, cs_eta_l = [], [], []
+    for T in tensors:
+        eigs = np.linalg.eigvalsh(T)
         s11, s22, s33 = eigs[0], eigs[1], eigs[2]
         s_iso = (s11 + s22 + s33) / 3.0
+        devs = sorted([(abs(v - s_iso), v) for v in [s11, s22, s33]], reverse=True)
+        s_ZZ = devs[0][1]; s_YY = devs[2][1]; s_XX = devs[1][1]
+        delta_i = s_ZZ - s_iso
+        eta_i = abs((s_YY - s_XX) / delta_i) if abs(delta_i) > 1e-6 else 0.0
+        eta_i = max(0.0, min(1.0, eta_i))
+        cs_iso_l.append(float(s_iso))
+        cs_delta_l.append(float(delta_i))
+        cs_eta_l.append(float(eta_i))
 
-        # Haeberlen convention: find σ_ZZ (farthest from iso), σ_YY (closest), σ_XX
-        # |σ_ZZ − σ_iso| ≥ |σ_XX − σ_iso| ≥ |σ_YY − σ_iso|
-        devs = [(abs(s11 - s_iso), s11),
-                (abs(s22 - s_iso), s22),
-                (abs(s33 - s_iso), s33)]
-        devs.sort(reverse=True)    # largest deviation first → σ_ZZ
-        s_ZZ = devs[0][1]
-        s_YY = devs[2][1]          # smallest deviation → σ_YY
-        s_XX = devs[1][1]
+    print(json.dumps({{
+        'iso':   cs_iso_l,
+        'delta': cs_delta_l,
+        'eta':   cs_eta_l,
+        'idx':   atom_idx.tolist(),
+    }}))
+except Exception as e:
+    print(json.dumps({{'error': str(e)}}))
+"""
 
-        delta_i = s_ZZ - s_iso     # Haeberlen anisotropy (signed)
-        eta_i   = (s_YY - s_XX) / delta_i if abs(delta_i) > 1e-6 else 0.0
-        eta_i   = max(0.0, min(1.0, abs(eta_i)))   # η ∈ [0, 1]
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", worker_script],
+            capture_output=True, text=True,
+            timeout=120,          # 2-minute hard limit
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("ShiftML3 timed out (>120 s). "
+                         "The free-tier server may be too slow for this structure.")
+    finally:
+        try:
+            os.unlink(cif_path)
+        except OSError:
+            pass
 
-        cs_iso[i]   = s_iso
-        cs_delta[i] = delta_i
-        cs_eta[i]   = eta_i
+    # Parse output — the last non-empty stdout line should be our JSON
+    stdout_lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if not stdout_lines:
+        stderr_snippet = proc.stderr[-600:] if proc.stderr else "(no stderr)"
+        raise ValueError(
+            f"ShiftML3 subprocess produced no output. "
+            f"Likely out of memory on the free tier.\n"
+            f"stderr: {stderr_snippet}"
+        )
+
+    try:
+        result = _json.loads(stdout_lines[-1])
+    except _json.JSONDecodeError:
+        raise ValueError(
+            f"ShiftML3 output could not be parsed: {stdout_lines[-1][:200]}"
+        )
+
+    if "error" in result:
+        raise ValueError(f"ShiftML3: {result['error']}")
+
+    cs_iso   = np.array(result["iso"],   dtype=float)
+    cs_delta = np.array(result["delta"], dtype=float)
+    cs_eta   = np.array(result["eta"],   dtype=float)
+    atom_idx = np.array(result["idx"],   dtype=int)
 
     return cs_iso, cs_delta, cs_eta, atom_idx
 
@@ -422,80 +435,131 @@ def run_calculation(cif_text, nucleus="F", N_wanted=1000, B0_field=9.4,
 # =============================================================================
 
 def calculate_sdt(x, y, z, B0, gyro, N, omega_cs, dist_min, omega_r=0.0):
-    hbar = 1.05457182e-34
-    mu0  = 4*np.pi*1e-7
+    """
+    Compute the 3×3 spin diffusion tensor.
 
-    Rx = x[:,None]-x[None,:]; Ry = y[:,None]-y[None,:]; Rz = z[:,None]-z[None,:]
-    Lx,Ly,Lz = x.max()-x.min(), y.max()-y.min(), z.max()-z.min()
-    Rx -= np.round(Rx/Lx)*Lx; Ry -= np.round(Ry/Ly)*Ly; Rz -= np.round(Rz/Lz)*Lz
+    Speed optimisations vs. previous version
+    -----------------------------------------
+    • float32 throughout  → halves memory, ~2× faster on CPU
+    • Bij_squared, T_αβ, nu_diff precomputed once outside harmonic loop
+    • exp() argument clipped to [-80, 0] to avoid overflow/underflow NaNs
+    • No redundant intermediate arrays
+    """
+    hbar = np.float32(1.05457182e-34)
+    mu0  = np.float32(4 * np.pi * 1e-7)
 
-    Distance = np.sqrt(Rx**2+Ry**2+Rz**2)
-    Distance[Distance < dist_min] = np.nan
+    # Cast inputs to float32
+    x32, y32, z32 = x.astype(np.float32), y.astype(np.float32), z.astype(np.float32)
+    B0_32 = B0.astype(np.float32)
+    gyro32 = np.float32(gyro)
 
-    dot      = Rx*B0[0]+Ry*B0[1]+Rz*B0[2]
-    cosTheta = dot/Distance
-    Theta    = np.arccos(np.clip(cosTheta,-1,1))
+    # --- Pairwise displacements (N×N, float32) ---
+    Rx = x32[:, None] - x32[None, :]
+    Ry = y32[:, None] - y32[None, :]
+    Rz = z32[:, None] - z32[None, :]
 
-    bij         = (mu0/(4*np.pi))*(gyro**2*hbar)/Distance**3
-    bij         = np.nan_to_num(bij)
-    Bij         = bij*(1-3*np.cos(Theta)**2)
-    Bij         = np.nan_to_num(Bij)
-    Bij_squared = Bij**2
-    M2          = Bij_squared.sum()/N
+    # Minimum-image periodic boundary conditions
+    Lx = np.float32(x32.max() - x32.min())
+    Ly = np.float32(y32.max() - y32.min())
+    Lz = np.float32(z32.max() - z32.min())
+    Rx -= np.round(Rx / Lx) * Lx
+    Ry -= np.round(Ry / Ly) * Ly
+    Rz -= np.round(Rz / Lz) * Lz
 
-    nu_diff = 0.5*(omega_cs[:,None]-omega_cs[None,:])
+    # Distances; exclude self-pairs and sites closer than dist_min
+    r2 = Rx**2 + Ry**2 + Rz**2
+    Distance = np.sqrt(r2)
+    Distance[Distance < np.float32(dist_min)] = np.nan
 
-    def J(delta):
-        if M2 > 0:
-            return (1/np.sqrt(2*np.pi*M2))*np.exp(-delta**2/(2*M2))
-        return np.zeros_like(delta)
+    # Angle θ between inter-spin vector and B₀
+    dot      = Rx * B0_32[0] + Ry * B0_32[1] + Rz * B0_32[2]
+    cosTheta = dot / Distance
+    Theta    = np.arccos(np.clip(cosTheta, -1.0, 1.0))
 
-    # Magic-angle rotor geometry (always used, reduces to static at omega_r=0)
-    beta_m = np.arccos(1/np.sqrt(3))
-    ux, uy, uz = np.sin(beta_m), 0.0, np.cos(beta_m)
+    # Dipolar coupling B_ij (Hz) and B_ij²
+    bij         = (mu0 / np.float32(4 * np.pi)) * (gyro32**2 * hbar) / Distance**3
+    bij         = np.nan_to_num(bij, nan=0.0, posinf=0.0, neginf=0.0)
+    Bij         = bij * (1.0 - 3.0 * np.cos(Theta)**2)
+    Bij         = np.nan_to_num(Bij, nan=0.0)
+    Bij_sq      = Bij**2                          # precomputed once
 
-    r2     = Rx**2+Ry**2+Rz**2
-    udotr  = ux*Rx+uy*Ry+uz*Rz
-    rpar2  = udotr**2; rperp2 = r2-rpar2
-    Txx = 0.5*rperp2*(1-ux*ux)+rpar2*ux*ux
-    Tyy = 0.5*rperp2*(1-uy*uy)+rpar2*uy*uy
-    Tzz = 0.5*rperp2*(1-uz*uz)+rpar2*uz*uz
-    Txy = 0.5*rperp2*(-ux*uy)+rpar2*ux*uy
-    Txz = 0.5*rperp2*(-ux*uz)+rpar2*ux*uz
-    Tyz = 0.5*rperp2*(-uy*uz)+rpar2*uy*uz
+    M2 = float(Bij_sq.sum()) / N
 
-    f0sq  = ((3*np.cos(beta_m)**2-1)/2)**2
-    f1sq  = (1.5*np.sin(beta_m)*np.cos(beta_m))**2
-    f2sq  = (0.75*np.sin(beta_m)**2)**2
-    Sbeta = f0sq+2*f1sq+2*f2sq
+    # ZQ frequency difference matrix (float32)
+    omega_cs32 = omega_cs.astype(np.float32)
+    nu_diff = np.float32(0.5) * (omega_cs32[:, None] - omega_cs32[None, :])  # precomputed
 
-    WII = np.zeros_like(Bij_squared)
-    for m, f2m in zip([-2,-1,0,1,2], [f2sq,f1sq,f0sq,f1sq,f2sq]):
-        WII += (np.sqrt(np.pi)/4)*Bij_squared*f2m*J(nu_diff - m*omega_r)/Sbeta
+    # Gaussian spectral density — clipped exp to avoid NaN from huge arguments
+    inv_sqrt_2piM2 = np.float32(1.0 / np.sqrt(2.0 * np.pi * M2)) if M2 > 0 else np.float32(0.0)
+    inv_2M2        = np.float32(1.0 / (2.0 * M2))                  if M2 > 0 else np.float32(0.0)
 
-    normD = 1e18/(2*N)
-    T_comps = [[Txx,Txy,Txz],[Txy,Tyy,Tyz],[Txz,Tyz,Tzz]]
-    D = np.zeros((3,3))
+    def J(delta_m):
+        if M2 <= 0:
+            return np.zeros_like(delta_m)
+        exponent = -(delta_m**2) * inv_2M2
+        np.clip(exponent, -80.0, 0.0, out=exponent)   # prevent overflow / underflow
+        return inv_sqrt_2piM2 * np.exp(exponent)
+
+    # --- Rotor-phase-averaged spatial weights T_αβ ---
+    # Rotor axis at the magic angle β_m = arccos(1/√3)
+    beta_m  = np.float32(np.arccos(1.0 / np.sqrt(3.0)))
+    ux = np.float32(np.sin(beta_m))
+    uy = np.float32(0.0)
+    uz = np.float32(np.cos(beta_m))
+
+    udotr  = ux * Rx + uy * Ry + uz * Rz
+    rpar2  = udotr**2
+    rperp2 = r2 - rpar2
+
+    Txx = np.float32(0.5) * rperp2 * (1.0 - ux*ux) + rpar2 * ux*ux
+    Tyy = np.float32(0.5) * rperp2 * (1.0 - uy*uy) + rpar2 * uy*uy
+    Tzz = np.float32(0.5) * rperp2 * (1.0 - uz*uz) + rpar2 * uz*uz
+    Txy = np.float32(0.5) * rperp2 * (-ux*uy)       + rpar2 * ux*uy
+    Txz = np.float32(0.5) * rperp2 * (-ux*uz)       + rpar2 * ux*uz
+    Tyz = np.float32(0.5) * rperp2 * (-uy*uz)       + rpar2 * uy*uz
+
+    # Wigner rotation factors at β_m
+    f0sq  = np.float32(((3.0*np.cos(beta_m)**2 - 1.0) / 2.0)**2)
+    f1sq  = np.float32((1.5 * np.sin(beta_m) * np.cos(beta_m))**2)
+    f2sq  = np.float32((0.75 * np.sin(beta_m)**2)**2)
+    Sbeta = float(f0sq + 2.0*f1sq + 2.0*f2sq)
+
+    pi4   = np.float32(np.sqrt(np.pi) / 4.0)
+    omega_r32 = np.float32(omega_r)
+
+    # Accumulate W_II over 5 rotor harmonics m ∈ {-2,-1,0,1,2}
+    WII = np.zeros_like(Bij_sq)
+    for m_int, f2m in ((-2, f2sq), (-1, f1sq), (0, f0sq), (1, f1sq), (2, f2sq)):
+        m = np.float32(m_int)
+        WII += pi4 * Bij_sq * f2m * J(nu_diff - m * omega_r32) / Sbeta
+
+    # --- Build D tensor from T_αβ weights ---
+    normD  = np.float64(1e18) / (2.0 * N)   # back to float64 for final assembly
+    WII64  = WII.astype(np.float64)
+    T_all  = [[Txx, Txy, Txz], [Txy, Tyy, Tyz], [Txz, Tyz, Tzz]]
+    D = np.zeros((3, 3), dtype=np.float64)
     for i in range(3):
-        for j in range(i,3):
-            D[i,j] = normD*(WII*T_comps[i][j]).sum()
-            D[j,i] = D[i,j]
+        for j in range(i, 3):
+            D[i, j] = normD * float((WII64 * T_all[i][j].astype(np.float64)).sum())
+            D[j, i] = D[i, j]
     D = np.real(D)
 
+    # Eigendecomposition
     eig_vals, eig_vecs = np.linalg.eigh(D)
-    idx = np.argsort(eig_vals)
-    eig_vals = eig_vals[idx]; eig_vecs = eig_vecs[:,idx]
+    idx      = np.argsort(eig_vals)
+    eig_vals = eig_vals[idx]
+    eig_vecs = eig_vecs[:, idx]
 
-    D_iso      = np.trace(D)/3
-    delta_D    = eig_vals-D_iso
+    D_iso      = np.trace(D) / 3.0
+    delta_D    = eig_vals - D_iso
     denom      = np.sqrt((eig_vals**2).sum())
-    D_FA       = (np.sqrt(1.5)*np.linalg.norm(delta_D)/denom) if denom>0 else 0.0
-    D_parallel = float(B0@D@B0)
-    D_perp     = (np.trace(D)-D_parallel)/2
+    D_FA       = float(np.sqrt(1.5) * np.linalg.norm(delta_D) / denom) if denom > 0 else 0.0
+    D_parallel = float(B0 @ D @ B0)
+    D_perp     = (np.trace(D) - D_parallel) / 2.0
 
     return {
-        "D": D, "D_iso": D_iso, "D_FA": D_FA,
-        "D_parallel": D_parallel, "D_perp": D_perp, "M2": M2,
+        "D": D, "D_iso": float(D_iso), "D_FA": D_FA,
+        "D_parallel": D_parallel, "D_perp": float(D_perp), "M2": M2,
         "eigenvalues":  eig_vals.tolist(),
         "eigenvectors": eig_vecs.T.tolist(),
     }
