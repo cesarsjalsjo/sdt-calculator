@@ -78,22 +78,25 @@ def calculate():
         return jsonify({"error": "Could not read the uploaded file."}), 400
 
     # --- Parse form parameters ---
-    nucleus  = request.form.get("nucleus",  "F").strip().upper()
-    disorder = float(request.form.get("disorder", 0.0))
-    B0_field = float(request.form.get("B0_field", 9.4))
-    N_wanted = int(request.form.get("N_wanted", 5000))
+    nucleus          = request.form.get("nucleus",          "F").strip().upper()
+    disorder         = float(request.form.get("disorder",         0.0))
+    B0_field         = float(request.form.get("B0_field",         9.4))
+    N_wanted         = int(request.form.get("N_wanted",           1000))
+    num_orientations = int(request.form.get("num_orientations",   50))
 
-    # Clamp N_wanted to a safe range (very large N is slow in a web context)
-    N_wanted = max(100, min(N_wanted, 2000))
+    # Clamp to safe ranges for the free tier (512 MB RAM)
+    N_wanted         = max(100, min(N_wanted, 2000))
+    num_orientations = max(1,   min(num_orientations, 200))
 
     # --- Run calculation ---
     try:
         result = run_calculation(
-            cif_text  = cif_text,
-            nucleus   = nucleus,
-            N_wanted  = N_wanted,
-            B0_field  = B0_field,
-            disorder  = disorder,
+            cif_text         = cif_text,
+            nucleus          = nucleus,
+            N_wanted         = N_wanted,
+            B0_field         = B0_field,
+            disorder         = disorder,
+            num_orientations = num_orientations,
         )
         return jsonify({"success": True, "result": result})
 

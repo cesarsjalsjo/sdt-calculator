@@ -29,25 +29,28 @@ NUCLEUS_PARAMS = {
 #  PUBLIC ENTRY POINT
 # =============================================================================
 
-def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
+def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 1000,
                     B0_field: float = 9.4, disorder: float = 0.0,
-                    dist_min: float = 2e-10) -> dict:
+                    dist_min: float = 2e-10, num_orientations: int = 50) -> dict:
     """
-    Full SDT calculation pipeline.
+    Full SDT calculation pipeline with powder orientation averaging.
 
     Parameters
     ----------
-    cif_text   : Raw text content of the CIF file.
-    nucleus    : NMR nucleus symbol: 'H', 'F', or 'P'.
-    N_wanted   : Target number of spin sites to simulate.
-    B0_field   : Static magnetic field strength in Tesla.
-    disorder   : Positional disorder amplitude [0–1]. 0 = perfect crystal.
-    dist_min   : Hard-core exclusion radius in metres.
+    cif_text         : Raw text content of the CIF file.
+    nucleus          : NMR nucleus symbol: 'H', 'F', or 'P'.
+    N_wanted         : Target number of spin sites to simulate.
+    B0_field         : Static magnetic field strength in Tesla.
+    disorder         : Positional disorder amplitude [0–1]. 0 = perfect crystal.
+    dist_min         : Hard-core exclusion radius in metres.
+    num_orientations : Number of random crystallite orientations to average over.
+                       0 = no averaging (single B0 along z only).
 
     Returns
     -------
     dict with keys: D, D_iso, D_FA, D_parallel, D_perp, M2,
-                    nearest_neighbors, concentration, unit_cell
+                    nearest_neighbors, concentration, unit_cell,
+                    orientation_averaged, num_orientations
     """
     if nucleus not in NUCLEUS_PARAMS:
         raise ValueError(f"Nucleus '{nucleus}' not supported. Choose from: {list(NUCLEUS_PARAMS)}")
@@ -55,11 +58,8 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
     gyro  = NUCLEUS_PARAMS[nucleus]["gyro"]
     abund = NUCLEUS_PARAMS[nucleus]["abund"]
 
-    # Normalised B₀ direction (always along z for this web version)
+    # Reference B₀ direction: along z. Each orientation rotates this.
     B0 = np.array([0.0, 0.0, 1.0])
-
-    # Larmor frequency in Hz
-    nu0 = gyro * B0_field / (2 * np.pi)
 
     # Physical constants
     Na = 6.02214076e23
@@ -81,13 +81,13 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
         x, y, z = apply_disorder(x, y, z, N, disorder,
                                  cell["a"], cell["b"], cell["c"], dist_min)
 
-    # Isotropic chemical shift (no CSA in this version — omega_cs = 0 for all)
+    # Isotropic chemical shift — zero for all spins (no CSA in this version)
     omega_cs = np.zeros(N)
 
     # -------------------------------------------------------------------------
     # 3. Compute concentration and Wigner–Seitz radius
     # -------------------------------------------------------------------------
-    a, b, c   = cell["a"], cell["b"], cell["c"]
+    a, b, c = cell["a"], cell["b"], cell["c"]
     alpha, beta_angle, gamma = cell["alpha"], cell["beta"], cell["gamma"]
 
     Lx = x.max() - x.min()
@@ -97,46 +97,108 @@ def run_calculation(cif_text: str, nucleus: str = "F", N_wanted: int = 5000,
               * np.sqrt(1 - np.cos(alpha)**2 - np.cos(beta_angle)**2 - np.cos(gamma)**2
                         + 2*np.cos(alpha)*np.cos(beta_angle)*np.cos(gamma)))
 
-    C_sim = N / (volume * 1e3 * Na)                      # mol L⁻¹
-    wsr   = 0.1 * (3 / (4 * np.pi * C_sim * Na))**(1/3) # Wigner–Seitz radius (m)
+    C_sim = N / (volume * 1e3 * Na)                       # mol L⁻¹
+    wsr   = 0.1 * (3 / (4 * np.pi * C_sim * Na))**(1/3)  # Wigner–Seitz radius (m)
 
     # -------------------------------------------------------------------------
-    # 4. Compute the diffusion tensor
+    # 4. Compute the diffusion tensor — with or without orientation averaging
     # -------------------------------------------------------------------------
-    result = calculate_sdt(x, y, z, B0, gyro, N, omega_cs, dist_min)
+    if num_orientations <= 1:
+        # --- Single orientation: B₀ along z ----------------------------------
+        result = calculate_sdt(x, y, z, B0, gyro, N, omega_cs, dist_min)
+        D_final    = result["D"]
+        D_iso_final    = result["D_iso"]
+        D_FA_final     = result["D_FA"]
+        D_par_final    = result["D_parallel"]
+        D_perp_final   = result["D_perp"]
+        M2_final       = result["M2"]
+        orient_averaged = False
+
+    else:
+        # --- Powder average over num_orientations random orientations ---------
+        # Draw random Euler angles for isotropic orientation distribution
+        # (same method as MATLAB: random alpha and beta from spherical distribution)
+        alpha_rot = 2 * np.pi * np.random.rand(num_orientations)       # Azimuthal [0, 2π]
+        beta_rot  = np.arccos(2 * np.random.rand(num_orientations) - 1) # Polar     [0, π]
+
+        D_stack    = np.zeros((3, 3, num_orientations))
+        D_iso_list = []
+        D_FA_list  = []
+        D_par_list = []
+        D_perp_list = []
+        M2_list    = []
+
+        for o in range(num_orientations):
+            # Build rotation matrix Rot = Rot_beta @ Rot_alpha
+            # Rot_alpha: rotation about Z by alpha
+            ca, sa = np.cos(alpha_rot[o]), np.sin(alpha_rot[o])
+            Rot_alpha = np.array([[ ca, -sa, 0],
+                                  [ sa,  ca, 0],
+                                  [  0,   0, 1]])
+
+            # Rot_beta: rotation about Y by beta
+            cb, sb = np.cos(beta_rot[o]), np.sin(beta_rot[o])
+            Rot_beta = np.array([[ cb, 0, sb],
+                                 [  0, 1,  0],
+                                 [-sb, 0, cb]])
+
+            Rot   = Rot_beta @ Rot_alpha
+
+            # Rotate B₀ into the crystal frame for this orientation
+            B0rot = Rot @ B0
+
+            # Calculate SDT for this orientation
+            res = calculate_sdt(x, y, z, B0rot, gyro, N, omega_cs, dist_min)
+
+            D_stack[:, :, o] = res["D"]
+            D_iso_list.append(res["D_iso"])
+            D_FA_list.append(res["D_FA"])
+            D_par_list.append(res["D_parallel"])
+            D_perp_list.append(res["D_perp"])
+            M2_list.append(res["M2"])
+
+        # Average over all orientations (equivalent to MATLAB's mean(D_rot, 3))
+        D_final      = D_stack.mean(axis=2)
+        D_iso_final  = float(np.mean(D_iso_list))
+        D_FA_final   = float(np.mean(D_FA_list))
+        D_par_final  = float(np.mean(D_par_list))
+        D_perp_final = float(np.mean(D_perp_list))
+        M2_final     = float(np.mean(M2_list))
+        orient_averaged = True
 
     # -------------------------------------------------------------------------
     # 5. Nearest-neighbour distances (Å) for reporting
     # -------------------------------------------------------------------------
     pts   = np.stack([x, y, z], axis=1)
-    diffs = pts[:, None, :] - pts[None, :, :]           # N×N×3
-    dists = np.sqrt((diffs**2).sum(axis=2)) * 1e10       # Å
+    diffs = pts[:, None, :] - pts[None, :, :]
+    dists = np.sqrt((diffs**2).sum(axis=2)) * 1e10   # Å
     np.fill_diagonal(dists, np.inf)
-    nn = dists.min(axis=1)                               # N-vector of NN distances
+    nn = dists.min(axis=1)
 
-    # Sub-sample cartesian coords for the 3D cloud plot (max 3000 points for browser performance)
-    plot_idx = np.random.choice(N, min(N, 3000), replace=False)
+    # Sub-sample Cartesian coords for 3D plot (cap at 2000 for browser performance)
+    plot_idx = np.random.choice(N, min(N, 2000), replace=False)
 
     return {
-        "D":                result["D"].tolist(),
-        "D_iso":            float(result["D_iso"]),
-        "D_FA":             float(result["D_FA"]),
-        "D_parallel":       float(result["D_parallel"]),
-        "D_perp":           float(result["D_perp"]),
-        "M2":               float(result["M2"]),
-        "N_spins":          N,
-        "concentration":    float(C_sim),
-        "wigner_seitz_r":   float(wsr * 1e10),          # in Å for display
+        "D":                    D_final.tolist(),
+        "D_iso":                D_iso_final,
+        "D_FA":                 D_FA_final,
+        "D_parallel":           D_par_final,
+        "D_perp":               D_perp_final,
+        "M2":                   M2_final,
+        "N_spins":              N,
+        "concentration":        float(C_sim),
+        "wigner_seitz_r":       float(wsr * 1e10),   # Å
+        "orientation_averaged": orient_averaged,
+        "num_orientations":     num_orientations if orient_averaged else 1,
         "nearest_neighbors": {
-            "mean":  float(nn.mean()),
-            "min":   float(nn.min()),
-            "max":   float(nn.max()),
+            "mean": float(nn.mean()),
+            "min":  float(nn.min()),
+            "max":  float(nn.max()),
         },
         "unit_cell": {k: float(v) for k, v in cell.items()},
-        # --- Plotting data ---
-        # unique_coords: fractional [0,1]³ coords of unique sites in one unit cell
+        # Fractional coords of unique sites in one unit cell (for unit cell plot)
         "unique_coords": unique_coords.tolist(),
-        # cartesian_sample: nm-scaled Cartesian coords for the full spin cloud plot
+        # Subsampled Cartesian coords in nm (for spin cloud plot)
         "cartesian_sample": {
             "x": (x[plot_idx] * 1e9).tolist(),
             "y": (y[plot_idx] * 1e9).tolist(),

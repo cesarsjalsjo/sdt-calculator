@@ -562,6 +562,14 @@ footer {
               <input type="number" id="nwanted" value="1000" min="100" max="3000" step="100"/>
             </div>
             <div class="field">
+              <label>Orientations</label>
+              <input type="number" id="norient" value="50" min="1" max="200" step="10"
+                     title="Number of random crystallite orientations for powder averaging. Set to 1 to disable."/>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field" style="grid-column: 1 / -1;">
               <label>Disorder [0–1]</label>
               <div class="slider-row">
                 <input type="range" id="disorder" min="0" max="1" step="0.05" value="0"
@@ -718,11 +726,12 @@ async function runCalc() {
 
   // Build form data to send to /calculate
   const form = new FormData();
-  form.append("file",      file);
-  form.append("nucleus",   document.getElementById("nucleus").value);
-  form.append("B0_field",  document.getElementById("b0field").value);
-  form.append("N_wanted",  document.getElementById("nwanted").value);
-  form.append("disorder",  document.getElementById("disorder").value);
+  form.append("file",             file);
+  form.append("nucleus",          document.getElementById("nucleus").value);
+  form.append("B0_field",         document.getElementById("b0field").value);
+  form.append("N_wanted",         document.getElementById("nwanted").value);
+  form.append("disorder",         document.getElementById("disorder").value);
+  form.append("num_orientations", document.getElementById("norient").value);
 
   // Show progress bar
   setStatus("visible", false, "Uploading and computing — this may take a few seconds…");
@@ -743,7 +752,10 @@ async function runCalc() {
     }
 
     renderResults(data.result);
-    setStatus("visible", true, `Done — ${data.result.N_spins.toLocaleString()} spin sites computed.`);
+    const avgLabel = data.result.orientation_averaged
+      ? `Powder average — ${data.result.num_orientations} orientations, ${data.result.N_spins.toLocaleString()} spins`
+      : `Single orientation — ${data.result.N_spins.toLocaleString()} spins`;
+    setStatus("visible", true, `Done — ${avgLabel}`);
 
   } catch (err) {
     setStatus("error", false, "Error: " + err.message);
@@ -758,6 +770,12 @@ async function runCalc() {
 // ============================================================
 
 function renderResults(r) {
+
+  // Update tensor panel header to reflect averaging mode
+  document.querySelector('#tensor-panel .panel-header').textContent =
+    r.orientation_averaged
+      ? `⟨D⟩  Powder-averaged tensor / nm² s⁻¹  (${r.num_orientations} orientations)`
+      : 'D  Diffusion Tensor / nm² s⁻¹  (single orientation)';
 
   // Show plots
   document.getElementById("plots-panel").style.display = "block";
