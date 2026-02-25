@@ -1,6 +1,6 @@
 """
-app.py — Flask web server for the SDT Calculator
-SSE streaming endpoint for live orientation progress.
+app.py — Flask server for SDT Calculator
+SSE streaming endpoint for live orientation progress + ShiftML status.
 """
 import os, json, traceback
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
@@ -36,6 +36,13 @@ def calculate():
     abund_pct_raw    = request.form.get("abund_pct", None)
     abund_pct        = float(abund_pct_raw) if abund_pct_raw else None
 
+    cs_source = request.form.get("cs_source", "none")
+    cs_ics    = float(request.form.get("cs_ics",   0.0))
+    cs_delta  = float(request.form.get("cs_delta", 0.0))
+    cs_eta    = float(request.form.get("cs_eta",   0.0))
+    # Clamp eta to [0,1]
+    cs_eta    = max(0.0, min(1.0, cs_eta))
+
     def generate():
         try:
             for item in run_calculation(
@@ -43,6 +50,7 @@ def calculate():
                 B0_field=B0_field, disorder=disorder,
                 num_orientations=num_orientations, mas_rate_khz=mas_rate_khz,
                 abund_mode=abund_mode, abund_pct=abund_pct,
+                cs_source=cs_source, cs_ics=cs_ics, cs_delta=cs_delta, cs_eta=cs_eta,
             ):
                 if isinstance(item, str):
                     yield f"data: {item}\n\n"

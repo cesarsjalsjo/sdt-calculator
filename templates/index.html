@@ -605,6 +605,55 @@ footer {
               <div id="natural_abund_label" style="font-family:var(--mono);font-size:12px;color:var(--dim);padding-top:6px;">100%</div>
             </div>
           </div>
+
+          <!-- Chemical Shift / CSA row -->
+          <div class="field-row" style="align-items:flex-start;">
+            <div class="field">
+              <label>Chemical shift / CSA</label>
+              <select id="cs_source" onchange="toggleCSFields()">
+                <option value="none">None (ω_cs = 0)</option>
+                <option value="shiftml">ShiftML3 — ML prediction</option>
+                <option value="manual">Manual entry</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- ShiftML notice -->
+          <div id="shiftml_notice" style="display:none; margin: 4px 0 8px 0;
+               background:rgba(255,200,80,0.08); border:1px solid rgba(255,200,80,0.25);
+               border-radius:6px; padding:10px 14px; font-size:12px; color:var(--dim); line-height:1.6;">
+            <strong style="color:var(--amber);">ShiftML3</strong> predicts the per-site isotropic shielding σ<sub>iso</sub>
+            and full CSA tensor from the crystal structure. These are used to compute δν<sub>ij</sub> = ½(ω<sub>i</sub>−ω<sub>j</sub>)
+            in the ZQ spectral density.<br>
+            ⚠ Supported elements: H, C, N, O, F, P, S, Cl, Na, Ca, Mg, K (organic solids).<br>
+            Runs on the server — first run downloads the model (~200 MB).
+          </div>
+
+          <!-- Manual CSA fields -->
+          <div id="manual_cs_fields" style="display:none;">
+            <div class="field-row">
+              <div class="field">
+                <label>δ<sub>iso</sub> / ppm</label>
+                <input type="number" id="cs_ics" value="0" step="1"
+                       title="Isotropic chemical shift (ppm). Differences between sites drive spin diffusion."/>
+              </div>
+              <div class="field">
+                <label>δ (CSA half-width) / ppm</label>
+                <input type="number" id="cs_delta" value="0" step="1"
+                       title="Haeberlen anisotropy δ = σ_ZZ − σ_iso (ppm). 0 = no CSA."/>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>η (CSA asymmetry) [0–1]</label>
+                <div class="slider-row">
+                  <input type="range" id="cs_eta" min="0" max="1" step="0.05" value="0"
+                         oninput="document.getElementById('cs_eta_val').textContent=this.value"/>
+                  <span id="cs_eta_val">0</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <button id="calc-btn" onclick="runCalc()" disabled>Calculate</button>
@@ -624,6 +673,10 @@ footer {
       <div class="status-msg" id="status-msg">Uploading file…</div>
       <div id="orient-counter" style="display:none; font-family:var(--mono); font-size:11px; color:var(--amber); margin-top:4px; letter-spacing:1px;">
         ORIENTATION <span id="orient-current">0</span> / <span id="orient-total">0</span>
+      </div>
+      <!-- ShiftML live status -->
+      <div id="shiftml-status" style="display:none; font-family:var(--mono); font-size:11px; margin-top:4px; padding:6px 10px; border-radius:4px; background:rgba(255,200,80,0.07); border:1px solid rgba(255,200,80,0.2); color:var(--amber);">
+        ⚙ <span id="shiftml-status-msg">Running ShiftML3…</span>
       </div>
     </div>
 
@@ -713,6 +766,12 @@ footer {
       </div>
     </div>
 
+    <!-- CSA / ShiftML results panel -->
+    <div class="panel" id="csa-panel" style="display:none">
+      <div class="panel-header" id="csa-panel-header">Chemical Shift / CSA Parameters</div>
+      <div class="panel-body" id="csa-panel-body" style="font-size:13px; line-height:1.9; color:var(--fg);"></div>
+    </div>
+
   </div>
 </main>
 
@@ -771,6 +830,15 @@ toggleAbundInput();
 document.getElementById("natural_abund_label").textContent =
   NATURAL_ABUND[document.getElementById("nucleus").value]+"%";
 
+// ============================================================
+//  CHEMICAL SHIFT / CSA UI
+// ============================================================
+function toggleCSFields() {
+  const src = document.getElementById("cs_source").value;
+  document.getElementById("shiftml_notice").style.display   = src==="shiftml" ? "" : "none";
+  document.getElementById("manual_cs_fields").style.display = src==="manual"  ? "" : "none";
+}
+
 
 // ============================================================
 //  CALCULATION  (SSE streaming)
@@ -792,12 +860,29 @@ function runCalc() {
   if (document.getElementById("abund_mode").value === "custom")
     form.append("abund_pct", document.getElementById("abund_pct").value);
 
+  const csSource = document.getElementById("cs_source").value;
+  form.append("cs_source", csSource);
+  if (csSource === "manual") {
+    form.append("cs_ics",   document.getElementById("cs_ics").value);
+    form.append("cs_delta", document.getElementById("cs_delta").value);
+    form.append("cs_eta",   document.getElementById("cs_eta").value);
+  }
+
   const numOrient = parseInt(document.getElementById("norient").value)||1;
   setStatus("visible", false, "Uploading and computing…");
   calcBtn.disabled = true;
 
-  ["placeholder","tensor-panel","pas-panel","readout-panel","cell-panel","plots-panel"]
+  ["placeholder","tensor-panel","pas-panel","readout-panel","cell-panel","plots-panel","csa-panel"]
     .forEach(id => { const el=document.getElementById(id); if(el) el.style.display="none"; });
+
+  // Show/hide ShiftML status indicator
+  const shiftmlStatusEl = document.getElementById("shiftml-status");
+  if (csSource === "shiftml") {
+    shiftmlStatusEl.style.display = "block";
+    document.getElementById("shiftml-status-msg").textContent = "Running ShiftML3…";
+  } else {
+    shiftmlStatusEl.style.display = "none";
+  }
 
   const orientCounter = document.getElementById("orient-counter");
   if (numOrient > 1) {
@@ -830,6 +915,17 @@ function runCalc() {
               fill.style.animation="none";
               fill.style.width = Math.round(parseInt(cur)/parseInt(tot)*100)+"%";
               setStatus("visible",false,`Computing — orientation ${cur} / ${tot}`);
+            } else if (line.startsWith("status:shiftml:")) {
+              // ShiftML progress/done message
+              const msg = line.slice("status:shiftml:".length);
+              document.getElementById("shiftml-status-msg").textContent = "✓ " + msg;
+              setStatus("visible",false,"ShiftML3: " + msg);
+            } else if (line.startsWith("status:shiftml_error:")) {
+              const msg = line.slice("status:shiftml_error:".length);
+              document.getElementById("shiftml-status-msg").textContent = "⚠ " + msg;
+              document.getElementById("shiftml-status").style.background="rgba(255,80,80,0.08)";
+              document.getElementById("shiftml-status").style.borderColor="rgba(255,80,80,0.3)";
+              document.getElementById("shiftml-status").style.color="#f87171";
             } else if (line.startsWith("result:")) {
               const result = JSON.parse(line.slice(7));
               orientCounter.style.display="none";
@@ -944,6 +1040,58 @@ function renderResults(r) {
      </div>`
   ).join("");
   document.getElementById("cell-panel").style.display = "block";
+
+  // --- CSA / ShiftML panel ---
+  const csaPanel  = document.getElementById("csa-panel");
+  const csaBody   = document.getElementById("csa-panel-body");
+  const csaHeader = document.getElementById("csa-panel-header");
+
+  if (r.csa_info) {
+    const ci = r.csa_info;
+    if (ci.source === "ShiftML3") {
+      csaHeader.textContent = "Chemical Shielding / CSA — ShiftML3 Prediction";
+      let html = `
+        <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;">
+          <tr style="color:var(--amber);border-bottom:1px solid var(--border);">
+            <th style="text-align:left;padding:4px 8px;">Site</th>
+            <th style="text-align:right;padding:4px 8px;">σ<sub>iso</sub> / ppm</th>
+            <th style="text-align:right;padding:4px 8px;">δ (CSA) / ppm</th>
+            <th style="text-align:right;padding:4px 8px;">η</th>
+          </tr>`;
+      ci.iso_values.forEach((iso,i) => {
+        const delta = ci.delta_values[i];
+        const eta   = ci.eta_values[i];
+        html += `<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+          <td style="padding:3px 8px;color:var(--dim);">Site ${i+1}</td>
+          <td style="text-align:right;padding:3px 8px;">${iso.toFixed(2)}</td>
+          <td style="text-align:right;padding:3px 8px;">${delta.toFixed(2)}</td>
+          <td style="text-align:right;padding:3px 8px;">${eta.toFixed(3)}</td>
+        </tr>`;
+      });
+      html += `</table>
+        <div style="margin-top:10px;font-size:11px;color:var(--dim);">
+          σ<sub>iso</sub> range: ${ci.iso_min.toFixed(1)} – ${ci.iso_max.toFixed(1)} ppm &nbsp;|&nbsp;
+          ⟨σ<sub>iso</sub>⟩ = ${ci.iso_mean.toFixed(2)} ± ${ci.iso_std.toFixed(2)} ppm &nbsp;|&nbsp;
+          ⟨δ⟩ = ${ci.delta_mean.toFixed(2)} ppm &nbsp;|&nbsp; ⟨η⟩ = ${ci.eta_mean.toFixed(3)}<br>
+          <em>Note: ShiftML3 predicts absolute shielding σ. Only differences Δσ<sub>ij</sub> enter ν̃<sub>ZQ</sub>.</em>
+        </div>`;
+      if (ci.error) {
+        html += `<div style="margin-top:8px;color:#f87171;font-size:11px;">⚠ ShiftML error: ${ci.error} — calculation used ω_cs = 0.</div>`;
+      }
+      csaBody.innerHTML = html;
+    } else if (ci.source === "manual") {
+      csaHeader.textContent = "Chemical Shift / CSA — Manual Entry";
+      csaBody.innerHTML = `<span style="font-family:var(--mono);font-size:12px;">
+        δ<sub>iso</sub> = ${ci.iso_mean.toFixed(2)} ppm &nbsp;|&nbsp;
+        δ (CSA) = ${ci.delta_mean.toFixed(2)} ppm &nbsp;|&nbsp;
+        η = ${ci.eta_mean.toFixed(3)} &nbsp;|&nbsp;
+        Applied uniformly to all ${r.N_spins.toLocaleString()} spin sites.
+      </span>`;
+    }
+    csaPanel.style.display = "block";
+  } else {
+    csaPanel.style.display = "none";
+  }
 }
 
 
