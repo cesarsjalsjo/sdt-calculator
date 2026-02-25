@@ -1,122 +1,61 @@
 """
 app.py — Flask web server for the SDT Calculator
-
-Endpoints
----------
-GET  /          → Serves the upload HTML page
-POST /calculate → Accepts a CIF file upload, runs the calculation, returns JSON
-GET  /health    → Simple health check for deployment platforms
+SSE streaming endpoint for live orientation progress.
 """
-
-import os
-import json
-import traceback
-from flask import Flask, request, jsonify, render_template
-from werkzeug.utils import secure_filename
-
+import os, json, traceback
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 from sdt_calc import run_calculation
 
-# =============================================================================
-#  APP CONFIGURATION
-# =============================================================================
-
 app = Flask(__name__)
-
-# Maximum upload size: 5 MB (CIF files are always tiny, but good practice)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-ALLOWED_EXTENSIONS = {"cif"}
-
-
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-# =============================================================================
-#  ROUTES
-# =============================================================================
+def allowed_file(f): return "." in f and f.rsplit(".",1)[1].lower() == "cif"
 
 @app.route("/")
-def index():
-    """Serve the main upload page."""
-    return render_template("index.html")
-
+def index(): return render_template("index.html")
 
 @app.route("/health")
-def health():
-    """Health check — deployment platforms (Render, Railway) ping this."""
-    return jsonify({"status": "ok"})
-
+def health(): return jsonify({"status":"ok"})
 
 @app.route("/calculate", methods=["POST"])
 def calculate():
-    """
-    Accepts a multipart/form-data POST with:
-        file     : the .cif file
-        nucleus  : 'H', 'F', or 'P'     (default: 'F')
-        N_wanted : integer               (default: 5000)
-        B0_field : float, Tesla          (default: 9.4)
-        disorder : float [0–1]           (default: 0.0)
-
-    Returns JSON with the diffusion tensor and derived quantities.
-    """
-
-    # --- Validate file ---
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded. Please attach a .cif file."}), 400
-
+    if "file" not in request.files: return jsonify({"error":"No file uploaded."}),400
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "No file selected."}), 400
-    if not allowed_file(file.filename):
-        return jsonify({"error": "Only .cif files are accepted."}), 400
+    if not file.filename or not allowed_file(file.filename):
+        return jsonify({"error":"Only .cif files accepted."}),400
+    try: cif_text = file.read().decode("utf-8", errors="replace")
+    except: return jsonify({"error":"Could not read file."}),400
 
-    # --- Read file content ---
-    try:
-        cif_text = file.read().decode("utf-8", errors="replace")
-    except Exception:
-        return jsonify({"error": "Could not read the uploaded file."}), 400
+    nucleus          = request.form.get("nucleus","F").strip().upper()
+    disorder         = float(request.form.get("disorder",0.0))
+    B0_field         = float(request.form.get("B0_field",9.4))
+    N_wanted         = max(100, min(int(request.form.get("N_wanted",1000)), 2000))
+    num_orientations = max(1,   min(int(request.form.get("num_orientations",50)), 200))
+    mas_rate_khz     = max(0.0, min(float(request.form.get("mas_rate_khz",0.0)), 200.0))
+    abund_mode       = request.form.get("abund_mode","natural")
+    abund_pct_raw    = request.form.get("abund_pct", None)
+    abund_pct        = float(abund_pct_raw) if abund_pct_raw else None
 
-    # --- Parse form parameters ---
-    nucleus          = request.form.get("nucleus",          "F").strip().upper()
-    disorder         = float(request.form.get("disorder",         0.0))
-    B0_field         = float(request.form.get("B0_field",         9.4))
-    N_wanted         = int(request.form.get("N_wanted",           1000))
-    num_orientations = int(request.form.get("num_orientations",   50))
+    def generate():
+        try:
+            for item in run_calculation(
+                cif_text=cif_text, nucleus=nucleus, N_wanted=N_wanted,
+                B0_field=B0_field, disorder=disorder,
+                num_orientations=num_orientations, mas_rate_khz=mas_rate_khz,
+                abund_mode=abund_mode, abund_pct=abund_pct,
+            ):
+                if isinstance(item, str):
+                    yield f"data: {item}\n\n"
+                else:
+                    yield f"data: result:{json.dumps(item)}\n\n"
+        except ValueError as e:
+            yield f"data: error:{e}\n\n"
+        except Exception:
+            traceback.print_exc()
+            yield "data: error:Calculation failed. Check your CIF and parameters.\n\n"
 
-    # Clamp to safe ranges for the free tier (512 MB RAM)
-    N_wanted         = max(100, min(N_wanted, 2000))
-    num_orientations = max(1,   min(num_orientations, 200))
-
-    # --- Run calculation ---
-    try:
-        result = run_calculation(
-            cif_text         = cif_text,
-            nucleus          = nucleus,
-            N_wanted         = N_wanted,
-            B0_field         = B0_field,
-            disorder         = disorder,
-            num_orientations = num_orientations,
-        )
-        return jsonify({"success": True, "result": result})
-
-    except ValueError as e:
-        # Expected errors (bad CIF, nucleus not found, etc.)
-        return jsonify({"error": str(e)}), 422
-
-    except Exception:
-        # Unexpected errors — log full traceback server-side, return safe message
-        traceback.print_exc()
-        return jsonify({"error": "Calculation failed due to an internal error. "
-                                 "Please check your CIF file and parameters."}), 500
-
-
-# =============================================================================
-#  ENTRY POINT
-# =============================================================================
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 if __name__ == "__main__":
-    # When running locally: python app.py
-    # On Render: gunicorn will import this module directly (see Procfile)
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)

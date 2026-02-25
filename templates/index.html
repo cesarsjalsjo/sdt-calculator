@@ -502,6 +502,8 @@ footer {
   pointer-events: none;
 }
 
+#pas-grid { grid-template-columns: repeat(5, 1fr) !important; }
+
 @media (max-width: 800px) {
   .plot-grid { grid-template-columns: 1fr; }
 }
@@ -548,6 +550,7 @@ footer {
                 <option value="F">¹⁹F</option>
                 <option value="H">¹H</option>
                 <option value="P">³¹P</option>
+                <option value="C">¹³C</option>
               </select>
             </div>
             <div class="field">
@@ -559,23 +562,47 @@ footer {
           <div class="field-row">
             <div class="field">
               <label>Spin sites (N)</label>
-              <input type="number" id="nwanted" value="1000" min="100" max="3000" step="100"/>
+              <input type="number" id="nwanted" value="1000" min="100" max="2000" step="100"/>
             </div>
             <div class="field">
               <label>Orientations</label>
               <input type="number" id="norient" value="50" min="1" max="200" step="10"
-                     title="Number of random crystallite orientations for powder averaging. Set to 1 to disable."/>
+                     title="Powder average orientations. Set to 1 for single static orientation."/>
             </div>
           </div>
 
           <div class="field-row">
-            <div class="field" style="grid-column: 1 / -1;">
+            <div class="field">
+              <label>MAS rate / kHz</label>
+              <input type="number" id="mas_rate" value="0" min="0" max="200" step="1"
+                     title="Magic Angle Spinning rate in kHz. 0 = static."/>
+            </div>
+            <div class="field">
               <label>Disorder [0–1]</label>
               <div class="slider-row">
                 <input type="range" id="disorder" min="0" max="1" step="0.05" value="0"
                        oninput="document.getElementById('disorder-val').textContent=this.value"/>
                 <span id="disorder-val">0</span>
               </div>
+            </div>
+          </div>
+
+          <!-- Isotope abundance row -->
+          <div class="field-row" style="align-items:flex-start;">
+            <div class="field">
+              <label>Isotope abundance</label>
+              <select id="abund_mode" onchange="toggleAbundInput()">
+                <option value="natural">Natural abundance</option>
+                <option value="custom">Custom %</option>
+              </select>
+            </div>
+            <div class="field" id="abund_pct_field" style="display:none;">
+              <label>Abundance / %</label>
+              <input type="number" id="abund_pct" value="100" min="0" max="100" step="1"/>
+            </div>
+            <div class="field" id="abund_natural_display">
+              <label style="opacity:0.5;">Natural value</label>
+              <div id="natural_abund_label" style="font-family:var(--mono);font-size:12px;color:var(--dim);padding-top:6px;">100%</div>
             </div>
           </div>
         </div>
@@ -595,6 +622,9 @@ footer {
         <div class="progress-fill" id="progress-fill"></div>
       </div>
       <div class="status-msg" id="status-msg">Uploading file…</div>
+      <div id="orient-counter" style="display:none; font-family:var(--mono); font-size:11px; color:var(--amber); margin-top:4px; letter-spacing:1px;">
+        ORIENTATION <span id="orient-current">0</span> / <span id="orient-total">0</span>
+      </div>
     </div>
 
     <!-- Placeholder before first calculation -->
@@ -628,6 +658,14 @@ footer {
       <div class="panel-header">Diffusion Tensor D / nm² s⁻¹</div>
       <div class="panel-body">
         <div class="tensor-grid" id="tensor-grid"></div>
+      </div>
+    </div>
+
+    <!-- PAS diagonalised tensor -->
+    <div class="panel" id="pas-panel" style="display:none">
+      <div class="panel-header">Principal Axis System (PAS) — D<sub>xx</sub> ≤ D<sub>yy</sub> ≤ D<sub>zz</sub></div>
+      <div class="panel-body">
+        <div class="tensor-grid" id="pas-grid" style="grid-template-columns:repeat(4,1fr);"></div>
       </div>
     </div>
 
@@ -717,14 +755,31 @@ dropZone.addEventListener("drop",      e => {
 
 
 // ============================================================
-//  CALCULATION
+//  ISOTOPE ABUNDANCE UI
+// ============================================================
+const NATURAL_ABUND = { F:"100", H:"99.985", P:"100", C:"1.07" };
+function toggleAbundInput() {
+  const mode = document.getElementById("abund_mode").value;
+  document.getElementById("abund_pct_field").style.display       = mode==="custom" ? "" : "none";
+  document.getElementById("abund_natural_display").style.display = mode==="natural" ? "" : "none";
+}
+document.getElementById("nucleus").addEventListener("change", () => {
+  const nuc = document.getElementById("nucleus").value;
+  document.getElementById("natural_abund_label").textContent = (NATURAL_ABUND[nuc]||"—")+"%";
+});
+toggleAbundInput();
+document.getElementById("natural_abund_label").textContent =
+  NATURAL_ABUND[document.getElementById("nucleus").value]+"%";
+
+
+// ============================================================
+//  CALCULATION  (SSE streaming)
 // ============================================================
 
-async function runCalc() {
+function runCalc() {
   const file = fileInput.files[0];
   if (!file) return;
 
-  // Build form data to send to /calculate
   const form = new FormData();
   form.append("file",             file);
   form.append("nucleus",          document.getElementById("nucleus").value);
@@ -732,36 +787,75 @@ async function runCalc() {
   form.append("N_wanted",         document.getElementById("nwanted").value);
   form.append("disorder",         document.getElementById("disorder").value);
   form.append("num_orientations", document.getElementById("norient").value);
+  form.append("mas_rate_khz",     document.getElementById("mas_rate").value);
+  form.append("abund_mode",       document.getElementById("abund_mode").value);
+  if (document.getElementById("abund_mode").value === "custom")
+    form.append("abund_pct", document.getElementById("abund_pct").value);
 
-  // Show progress bar
-  setStatus("visible", false, "Uploading and computing — this may take a few seconds…");
+  const numOrient = parseInt(document.getElementById("norient").value)||1;
+  setStatus("visible", false, "Uploading and computing…");
   calcBtn.disabled = true;
 
-  // Hide previous results
-  document.getElementById("placeholder").style.display   = "none";
-  document.getElementById("tensor-panel").style.display  = "none";
-  document.getElementById("readout-panel").style.display = "none";
-  document.getElementById("cell-panel").style.display    = "none";
+  ["placeholder","tensor-panel","pas-panel","readout-panel","cell-panel","plots-panel"]
+    .forEach(id => { const el=document.getElementById(id); if(el) el.style.display="none"; });
 
-  try {
-    const response = await fetch("/calculate", { method: "POST", body: form });
-    const data     = await response.json();
-
-    if (!response.ok || !data.success) {
-      throw new Error(data.error || "Unknown server error.");
-    }
-
-    renderResults(data.result);
-    const avgLabel = data.result.orientation_averaged
-      ? `Powder average — ${data.result.num_orientations} orientations, ${data.result.N_spins.toLocaleString()} spins`
-      : `Single orientation — ${data.result.N_spins.toLocaleString()} spins`;
-    setStatus("visible", true, `Done — ${avgLabel}`);
-
-  } catch (err) {
-    setStatus("error", false, "Error: " + err.message);
-  } finally {
-    calcBtn.disabled = false;
+  const orientCounter = document.getElementById("orient-counter");
+  if (numOrient > 1) {
+    orientCounter.style.display = "block";
+    document.getElementById("orient-current").textContent = "0";
+    document.getElementById("orient-total").textContent   = numOrient;
+  } else {
+    orientCounter.style.display = "none";
   }
+
+  fetch("/calculate", { method:"POST", body:form })
+    .then(response => {
+      if (!response.ok) throw new Error("Server error "+response.status);
+      const reader=response.body.getReader(), decoder=new TextDecoder();
+      let buffer="";
+      function pump() {
+        return reader.read().then(({done,value}) => {
+          if (done) { calcBtn.disabled=false; return; }
+          buffer += decoder.decode(value,{stream:true});
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop();
+          for (const part of parts) {
+            const line = part.replace(/^data:\s*/,"").trim();
+            if (!line) continue;
+            if (line.startsWith("progress:")) {
+              const [,cur,tot] = line.split(":");
+              document.getElementById("orient-current").textContent = cur;
+              document.getElementById("orient-total").textContent   = tot;
+              const fill = document.getElementById("progress-fill");
+              fill.style.animation="none";
+              fill.style.width = Math.round(parseInt(cur)/parseInt(tot)*100)+"%";
+              setStatus("visible",false,`Computing — orientation ${cur} / ${tot}`);
+            } else if (line.startsWith("result:")) {
+              const result = JSON.parse(line.slice(7));
+              orientCounter.style.display="none";
+              renderResults(result);
+              const masStr = result.mas_rate_khz>0 ? `, MAS ${result.mas_rate_khz} kHz`:"";
+              const label = result.orientation_averaged
+                ? `Done — ${result.num_orientations} orientations, ${result.N_spins.toLocaleString()} spins${masStr}`
+                : `Done — single orientation, ${result.N_spins.toLocaleString()} spins${masStr}`;
+              setStatus("visible",true,label);
+              calcBtn.disabled=false;
+            } else if (line.startsWith("error:")) {
+              setStatus("error",false,"Error: "+line.slice(6));
+              orientCounter.style.display="none";
+              calcBtn.disabled=false;
+            }
+          }
+          return pump();
+        });
+      }
+      return pump();
+    })
+    .catch(err => {
+      setStatus("error",false,"Error: "+err.message);
+      document.getElementById("orient-counter").style.display="none";
+      calcBtn.disabled=false;
+    });
 }
 
 
@@ -770,33 +864,58 @@ async function runCalc() {
 // ============================================================
 
 function renderResults(r) {
-
-  // Update tensor panel header to reflect averaging mode
   document.querySelector('#tensor-panel .panel-header').textContent =
     r.orientation_averaged
       ? `⟨D⟩  Powder-averaged tensor / nm² s⁻¹  (${r.num_orientations} orientations)`
       : 'D  Diffusion Tensor / nm² s⁻¹  (single orientation)';
 
-  // Show plots
   document.getElementById("plots-panel").style.display = "block";
   renderPlots(r);
-  const grid   = document.getElementById("tensor-grid");
-  const D      = r.D;
-  // Find the max absolute value for normalising near-zero detection
-  const absMax = Math.max(...D.flat().map(Math.abs));
 
-  grid.innerHTML = "";
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      const val  = D[i][j];
-      const cell = document.createElement("div");
-      cell.className = "tensor-cell";
-      if (Math.abs(val) < 0.001 * absMax) cell.classList.add("near-zero");
-      cell.textContent = fmtNum(val);
-      grid.appendChild(cell);
-    }
+  // Full D tensor 3×3
+  const grid=document.getElementById("tensor-grid"), D=r.D;
+  const absMax=Math.max(...D.flat().map(Math.abs));
+  grid.innerHTML="";
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+    const val=D[i][j], cell=document.createElement("div");
+    cell.className="tensor-cell";
+    if (Math.abs(val)<0.001*absMax) cell.classList.add("near-zero");
+    cell.textContent=fmtNum(val);
+    cell.style.animationDelay=(i*3+j)*0.04+"s";
+    grid.appendChild(cell);
   }
-  document.getElementById("tensor-panel").style.display = "block";
+  document.getElementById("tensor-panel").style.display="block";
+
+  // PAS diagonalised tensor
+  const pas = r.PAS;
+  const pasGrid = document.getElementById("pas-grid");
+  pasGrid.innerHTML = "";
+  const labels = ["D\u2093\u2093","D\u1D67\u1D67","D\u1D69\u1D69"];
+  const axisNames = ["x","y","z"];
+  // Header row
+  ["Axis","D_PAS / nm²s⁻¹","e\u2081","e\u2082","e\u2083"].forEach(h => {
+    const hc=document.createElement("div");
+    hc.className="tensor-cell near-zero";
+    hc.style.fontSize="10px"; hc.innerHTML=h; pasGrid.appendChild(hc);
+  });
+  pas.eigenvalues.forEach((val,i) => {
+    const rowLabel=document.createElement("div");
+    rowLabel.className="tensor-cell near-zero";
+    rowLabel.style.fontSize="11px";
+    rowLabel.textContent=axisNames[i].toUpperCase();
+    pasGrid.appendChild(rowLabel);
+    const vc=document.createElement("div");
+    vc.className="tensor-cell"; vc.textContent=fmtNum(val);
+    pasGrid.appendChild(vc);
+    pas.eigenvectors[i].forEach(comp => {
+      const cc=document.createElement("div");
+      cc.className="tensor-cell near-zero";
+      cc.style.fontSize="10px";
+      cc.textContent=comp.toFixed(3);
+      pasGrid.appendChild(cc);
+    });
+  });
+  document.getElementById("pas-panel").style.display="block";
 
   // --- Scalar readouts ---
   document.getElementById("r-diso").textContent  = fmtNum(r.D_iso);
