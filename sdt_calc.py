@@ -46,145 +46,76 @@ SHIFTML_ELEMENTS = {"H", "C", "N", "O", "S", "F", "P", "Cl", "Na", "Ca", "Mg", "
 
 def run_shiftml(cif_text: str, nucleus: str):
     """
-    Run ShiftML3 in an isolated subprocess with gevent-friendly polling.
+    Run ShiftML3 directly in-process (no subprocess).
 
-    subprocess.run() blocks the entire gevent hub (it calls select() internally),
-    which prevents Gunicorn's heartbeat and triggers WORKER TIMEOUT even under
-    gevent monkey-patching.  The fix: use Popen and poll() in a loop with
-    gevent.sleep() so the hub can service other greenlets while we wait.
+    Requires ase and shiftml to be installed as proper build dependencies
+    (listed in requirements.txt). Runs synchronously; the gevent worker in
+    gunicorn keeps the SSE stream alive while this executes.
 
     Returns (cs_iso, cs_delta, cs_eta, atom_idx) on success.
     Raises ValueError with a clear message on failure.
     """
-    import subprocess, sys, json as _json, tempfile, os, time
+    import tempfile, os
 
-    # Try to import gevent.sleep for cooperative yielding; fall back to time.sleep
     try:
-        from gevent import sleep as gsleep
-    except ImportError:
-        from time import sleep as gsleep
+        from ase.io import read as ase_read
+        from shiftml.ase import ShiftML
+    except ImportError as e:
+        raise ValueError(
+            f"ShiftML dependencies not installed: {e}. "
+            "Ensure 'ase' and 'shiftml' are in requirements.txt."
+        )
 
-    # Write CIF to a temp file for the subprocess
+    # Write CIF to a temp file for ASE to read
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cif",
                                      delete=False, encoding="utf-8") as tf:
         tf.write(cif_text)
         cif_path = tf.name
 
-    worker_script = f"""
-import sys, json, subprocess, numpy as np
-
-# Install dependencies at runtime if not present (keeps build lean)
-def ensure(pkg, import_name=None):
     try:
-        __import__(import_name or pkg)
-    except ImportError:
-        subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'], check=True)
-
-ensure('ase')
-ensure('shiftml')
-
-cif_path = {repr(cif_path)}
-nucleus  = {repr(nucleus)}
-try:
-    from ase.io import read as ase_read
-    from shiftml.ase import ShiftML
-
-    frame = ase_read(cif_path, format='cif')
-    symbols = np.array(frame.get_chemical_symbols())
-    atom_idx = np.where(symbols == nucleus)[0]
-    if len(atom_idx) == 0:
-        print(json.dumps({{'error': f"No {{nucleus}} atoms found in CIF by ASE."}}))
-        sys.exit(0)
-
-    calculator = ShiftML("ShiftML3", device="cpu")
-    cs_tensor_all = calculator.get_cs_tensor(frame)
-    tensors = cs_tensor_all[atom_idx]
-
-    cs_iso_l, cs_delta_l, cs_eta_l = [], [], []
-    for T in tensors:
-        eigs = np.linalg.eigvalsh(T)
-        s11, s22, s33 = eigs[0], eigs[1], eigs[2]
-        s_iso = (s11 + s22 + s33) / 3.0
-        devs = sorted([(abs(v - s_iso), v) for v in [s11, s22, s33]], reverse=True)
-        s_ZZ = devs[0][1]; s_YY = devs[2][1]; s_XX = devs[1][1]
-        delta_i = s_ZZ - s_iso
-        eta_i = abs((s_YY - s_XX) / delta_i) if abs(delta_i) > 1e-6 else 0.0
-        eta_i = max(0.0, min(1.0, eta_i))
-        cs_iso_l.append(float(s_iso))
-        cs_delta_l.append(float(delta_i))
-        cs_eta_l.append(float(eta_i))
-
-    print(json.dumps({{
-        'iso':   cs_iso_l,
-        'delta': cs_delta_l,
-        'eta':   cs_eta_l,
-        'idx':   atom_idx.tolist(),
-    }}))
-except Exception as e:
-    print(json.dumps({{'error': str(e)}}))
-"""
-
-    TIMEOUT = 150   # seconds — generous for model download + inference
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-c", worker_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        deadline = time.time() + TIMEOUT
-        while proc.poll() is None:
-            if time.time() > deadline:
-                proc.kill()
-                raise ValueError(
-                    f"ShiftML3 timed out after {TIMEOUT}s. "
-                    "The free-tier server is too memory-constrained for this model. "
-                    "Try a different nucleus or use Manual / None CS mode."
-                )
-            gsleep(0.5)   # yield to gevent hub — keeps SSE alive and heartbeat running
-
-        stdout, stderr = proc.communicate()
-
-    except ValueError:
-        raise
+        frame = ase_read(cif_path, format="cif")
     except Exception as e:
-        raise ValueError(f"ShiftML3 subprocess error: {e}")
+        raise ValueError(f"ASE could not parse CIF: {e}")
     finally:
         try:
             os.unlink(cif_path)
         except OSError:
             pass
-        if proc and proc.poll() is None:
-            proc.kill()
 
-    # Parse the last non-empty line of stdout as JSON
-    stdout_lines = [l.strip() for l in stdout.splitlines() if l.strip()]
-    if not stdout_lines:
-        snippet = stderr[-400:] if stderr else "(no stderr)"
-        raise ValueError(
-            "ShiftML3 produced no output — likely killed by OOM on the free tier. "
-            f"stderr: {snippet}"
-        )
+    symbols  = np.array(frame.get_chemical_symbols())
+    atom_idx = np.where(symbols == nucleus)[0]
+    if len(atom_idx) == 0:
+        raise ValueError(f"No {nucleus} atoms found in CIF by ASE.")
 
     try:
-        result = _json.loads(stdout_lines[-1])
-    except _json.JSONDecodeError:
-        raise ValueError(f"ShiftML3 output unparseable: {stdout_lines[-1][:200]}")
+        calculator    = ShiftML("ShiftML3", device="cpu")
+        cs_tensor_all = calculator.get_cs_tensor(frame)
+    except Exception as e:
+        raise ValueError(f"ShiftML3 inference failed: {e}")
 
-    if "error" in result:
-        raise ValueError(f"ShiftML3: {result['error']}")
+    tensors = cs_tensor_all[atom_idx]
 
-    cs_iso   = np.array(result["iso"],   dtype=float)
-    cs_delta = np.array(result["delta"], dtype=float)
-    cs_eta   = np.array(result["eta"],   dtype=float)
-    atom_idx = np.array(result["idx"],   dtype=int)
-    return cs_iso, cs_delta, cs_eta, atom_idx
-    cs_eta   = np.array(result["eta"],   dtype=float)
-    atom_idx = np.array(result["idx"],   dtype=int)
+    cs_iso_l, cs_delta_l, cs_eta_l = [], [], []
+    for T in tensors:
+        eigs = np.linalg.eigvalsh(T)
+        s11, s22, s33 = float(eigs[0]), float(eigs[1]), float(eigs[2])
+        s_iso = (s11 + s22 + s33) / 3.0
+        devs  = sorted([(abs(v - s_iso), v) for v in [s11, s22, s33]], reverse=True)
+        s_ZZ  = devs[0][1]
+        s_YY  = devs[2][1]
+        s_XX  = devs[1][1]
+        delta_i = s_ZZ - s_iso
+        eta_i   = abs((s_YY - s_XX) / delta_i) if abs(delta_i) > 1e-6 else 0.0
+        cs_iso_l.append(s_iso)
+        cs_delta_l.append(delta_i)
+        cs_eta_l.append(max(0.0, min(1.0, eta_i)))
 
-    return cs_iso, cs_delta, cs_eta, atom_idx
+    return (
+        np.array(cs_iso_l,   dtype=float),
+        np.array(cs_delta_l, dtype=float),
+        np.array(cs_eta_l,   dtype=float),
+        atom_idx,
+    )
 
 
 # =============================================================================
