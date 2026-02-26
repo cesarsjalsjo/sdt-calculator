@@ -1,25 +1,11 @@
 """
 sdt_calc.py  —  Spin Diffusion Tensor Calculator
 
-New in this version:
-  - ShiftML3 integration: predicts per-site isotropic chemical shielding
-    and the full 3×3 CSA tensor directly from the crystal structure.
+ShiftML3 integration: predicts per-site isotropic chemical shielding
+and the full 3x3 CSA tensor directly from the crystal structure.
   - cs_source = "shiftml" : use ML-predicted shifts + CSA in the SDT.
   - cs_source = "manual"  : use user-supplied ics / delta / eta scalars
-    (same as the original MATLAB code).
-  - cs_source = "none"    : all omega_cs = 0 (original web app default).
-
-Physics of CSA → omega_cs  (matches SDT_Calc.m exactly)
-  Crystalline model  : omega_cs[i] = ics[i] * nu0 * 1e-6   (Hz)
-  Amorphous model    : random PAS orientation drawn per spin,
-      ppm_cs[i] = ics[i] + (delta[i]/2) * (3cos²θ−1 + η*sin²θ*cos2φ)
-      omega_cs[i] = ppm_cs[i] * nu0 * 1e-6
-
-ShiftML note
-  ShiftML predicts absolute shielding σ (ppm).  Only *differences* between
-  sites enter the ZQ spectral density  δν_ij = ½(ω_i − ω_j), so the unknown
-  reference offset cancels exactly.  The Haeberlen CSA parameters are
-  extracted from the diagonalised shielding tensor.
+  - cs_source = "none"    : all omega_cs = 0 (original web app default)
 """
 
 import re
@@ -37,7 +23,6 @@ NUCLEUS_PARAMS = {
     "C": {"gyro":  67.283e6, "abund": 0.0107},
 }
 
-# Elements supported by ShiftML3
 SHIFTML_ELEMENTS = {"H", "C", "N", "O", "S", "F", "P", "Cl", "Na", "Ca", "Mg", "K"}
 
 # =============================================================================
@@ -46,11 +31,9 @@ SHIFTML_ELEMENTS = {"H", "C", "N", "O", "S", "F", "P", "Cl", "Na", "Ca", "Mg", "
 
 def run_shiftml(cif_text: str, nucleus: str):
     """
-    Run ShiftML3 directly in-process (no subprocess).
-
-    Requires ase and shiftml to be installed as proper build dependencies
-    (listed in requirements.txt). Runs synchronously; the gevent worker in
-    gunicorn keeps the SSE stream alive while this executes.
+    Run ShiftML3 directly in-process using a real OS thread (called from
+    app.py via threading.Thread, so PyTorch imports cleanly without any
+    gevent / monkey-patch interference).
 
     Returns (cs_iso, cs_delta, cs_eta, atom_idx) on success.
     Raises ValueError with a clear message on failure.
@@ -66,7 +49,6 @@ def run_shiftml(cif_text: str, nucleus: str):
             "Ensure 'ase' and 'shiftml' are in requirements.txt."
         )
 
-    # Write CIF to a temp file for ASE to read
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cif",
                                      delete=False, encoding="utf-8") as tf:
         tf.write(cif_text)
@@ -97,13 +79,13 @@ def run_shiftml(cif_text: str, nucleus: str):
 
     cs_iso_l, cs_delta_l, cs_eta_l = [], [], []
     for T in tensors:
-        eigs = np.linalg.eigvalsh(T)
+        eigs  = np.linalg.eigvalsh(T)
         s11, s22, s33 = float(eigs[0]), float(eigs[1]), float(eigs[2])
-        s_iso = (s11 + s22 + s33) / 3.0
-        devs  = sorted([(abs(v - s_iso), v) for v in [s11, s22, s33]], reverse=True)
-        s_ZZ  = devs[0][1]
-        s_YY  = devs[2][1]
-        s_XX  = devs[1][1]
+        s_iso   = (s11 + s22 + s33) / 3.0
+        devs    = sorted([(abs(v - s_iso), v) for v in [s11, s22, s33]], reverse=True)
+        s_ZZ    = devs[0][1]
+        s_YY    = devs[2][1]
+        s_XX    = devs[1][1]
         delta_i = s_ZZ - s_iso
         eta_i   = abs((s_YY - s_XX) / delta_i) if abs(delta_i) > 1e-6 else 0.0
         cs_iso_l.append(s_iso)

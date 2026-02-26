@@ -1,18 +1,18 @@
 """
 app.py — Flask server for SDT Calculator
 
-Gevent monkey-patching at the very top makes all blocking I/O (including
-subprocess.communicate) non-blocking, so the Gunicorn sync worker's 30-second
-timeout signal never fires mid-stream.  This works regardless of whether
-Gunicorn uses the sync or gevent worker class.
+NO gevent monkey-patching. Uses a plain sync gunicorn worker.
+
+The ShiftML calculation runs in a real OS thread (threading.Thread) so
+that PyTorch can import cleanly — gevent's monkey.patch_all() intercepts
+os.path.exists at a low level which causes PyTorch to crash on import.
+
+The SSE generator drains a queue from that thread, sending a keepalive
+comment every second so proxies and the client don't close the connection
+while ShiftML is running (can take 30-120s on first run).
 """
 
-# ── Gevent monkey-patch MUST be the very first import ──────────────────────
-from gevent import monkey
-monkey.patch_all()
-# ───────────────────────────────────────────────────────────────────────────
-
-import os, json, traceback
+import os, json, traceback, queue, threading
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 from sdt_calc import run_calculation
 
@@ -51,7 +51,12 @@ def calculate():
     cs_delta  = float(request.form.get("cs_delta", 0.0))
     cs_eta    = max(0.0, min(1.0, float(request.form.get("cs_eta", 0.0))))
 
-    def generate():
+    # Queue-based threading: run_calculation runs in a real OS thread.
+    # The SSE generator below drains results from the queue.
+    # None is the sentinel that signals the thread has finished.
+    result_queue = queue.Queue()
+
+    def worker():
         try:
             for item in run_calculation(
                 cif_text=cif_text, nucleus=nucleus, N_wanted=N_wanted,
@@ -60,15 +65,35 @@ def calculate():
                 abund_mode=abund_mode, abund_pct=abund_pct,
                 cs_source=cs_source, cs_ics=cs_ics, cs_delta=cs_delta, cs_eta=cs_eta,
             ):
-                if isinstance(item, str):
-                    yield f"data: {item}\n\n"
-                else:
-                    yield f"data: result:{json.dumps(item)}\n\n"
-        except ValueError as e:
-            yield f"data: error:{e}\n\n"
-        except Exception:
-            traceback.print_exc()
-            yield "data: error:Calculation failed. Check your CIF and parameters.\n\n"
+                result_queue.put(("ok", item))
+        except Exception as e:
+            result_queue.put(("err", str(e)))
+        finally:
+            result_queue.put(None)  # sentinel
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def generate():
+        while True:
+            try:
+                item = result_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Send a keepalive SSE comment — keeps connection open
+                # while ShiftML downloads weights / runs inference
+                yield ": keepalive\n\n"
+                continue
+
+            if item is None:  # sentinel — thread done
+                break
+
+            kind, payload = item
+            if kind == "err":
+                yield f"data: error:{payload}\n\n"
+                break
+            if isinstance(payload, str):
+                yield f"data: {payload}\n\n"
+            else:
+                yield f"data: result:{json.dumps(payload)}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
